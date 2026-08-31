@@ -55,6 +55,12 @@ def _build_graph_input(spec: RunSpec) -> Any:
     return None
 
 
+def _configurable_id(config: Any) -> str | None:
+    """从 RunnableConfig 的 configurable 中提取 checkpoint_id。"""
+    conf = cast("dict[str, Any]", config.get("configurable") or {})
+    return conf.get("checkpoint_id") or None
+
+
 def _as_node_tuple(value: Any) -> tuple[str, ...] | None:
     """interrupt_before/after 接受节点名列表或 "*"。"""
     if value is None:
@@ -167,7 +173,16 @@ class RunExecutor:
             },
         ):
             try:
-                await self._store.update(spec.run_id, status="running")
+                base = await self._saver.aget_tuple(
+                    {
+                        "configurable": {
+                            "thread_id": spec.thread_id,
+                            "checkpoint_ns": "",
+                        }
+                    }
+                )
+                base_id = _configurable_id(base.config) if base is not None else None
+                await self._store.update(spec.run_id, status="running", base_checkpoint_id=base_id)
                 graph = self._registry.compile_distributed(
                     spec.graph_id, self, checkpointer=self._saver
                 )
@@ -304,14 +319,20 @@ class ControlDispatcher:
     async def serve_forever(self) -> None:
         reaper = asyncio.create_task(self._reap_loop())
         try:
-            async for envelope in self._control.consume_control():
-                kind = envelope.payload.get("kind")
-                if kind == "start":
-                    if self.draining:
-                        continue
-                    await self._start(envelope)
-                elif kind == "cancel":
-                    await self._cancel(envelope)
+            while True:
+                try:
+                    async for envelope in self._control.consume_control():
+                        kind = envelope.payload.get("kind")
+                        if kind == "start":
+                            if self.draining:
+                                continue
+                            await self._start(envelope)
+                        elif kind == "cancel":
+                            await self._cancel(envelope)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await asyncio.sleep(0.5)
         finally:
             reaper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -424,13 +445,17 @@ class ControlDispatcher:
         run_id = str(payload["run_id"])
         thread_id = str(payload["thread_id"])
         action = str(payload.get("action", "interrupt"))
-        # 幂等：只有运行中的 run 可以被取消，已到终态的忽略。
+        # 幂等：终态（success/error）的 run 忽略；pending/running/interrupted
+        # 均可取消——挂起等待审批（interrupted）的 run 正是 rollback 的主场景。
         record = await self._store.get(run_id)
-        if record is None or record["status"] != "running":
+        if record is None or record["status"] in ("success", "error", "timeout"):
             return
         self._cancel_local(thread_id)
         if action == "rollback":
-            await self._saver.adelete_thread(thread_id)
-            await self._store.delete(run_id)
+            # 精确回滚：只删除本 run 产生的 checkpoint（base 之后），
+            # 线程回到 run 启动前的状态；run 记录保留以供审计。
+            base_id = record.get("base_checkpoint_id")
+            await self._saver.adelete_checkpoints_after(thread_id, base_id or None)
+            await self._store.update(run_id, status="interrupted")
         else:
             await self._store.update(run_id, status="interrupted")

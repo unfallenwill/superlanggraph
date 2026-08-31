@@ -1,4 +1,4 @@
-# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
 # redis-py 部分方法存根类型不完整；测试为类型边界，src/ 不受影响。
 
 """E2E 验收夹具：真实 uvicorn 服务 + 真 Redis + 未修改的 langgraph-sdk。"""

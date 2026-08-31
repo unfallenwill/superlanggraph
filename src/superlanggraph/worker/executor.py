@@ -144,7 +144,11 @@ class NodeWorker:
             if lease is None:
                 continue
             receipt, envelope = lease
-            await self._handle_envelope(envelope, ack_receipt=receipt)
+            try:
+                await self._handle_envelope(envelope, ack_receipt=receipt)
+            except Exception:
+                # 单任务处理失败不应中断消费循环；消息未 ack 会被重新投递。
+                await asyncio.sleep(0.5)
 
     async def _handle_envelope(self, envelope: Envelope, *, ack_receipt: str) -> None:
         context = extract_from_envelope(envelope)

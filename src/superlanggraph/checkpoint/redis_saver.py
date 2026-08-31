@@ -185,6 +185,45 @@ class RedisSaver(BaseCheckpointSaver[str]):
             self._writes_key(thread_id),
         )
 
+    async def adelete_checkpoints_after(
+        self,
+        thread_id: str,
+        base_checkpoint_id: str | None,
+        checkpoint_ns: str = "",
+    ) -> int:
+        """精确回滚：删除 base 之后（字典序 > base）的全部 checkpoint 与写入。
+
+        语义：线程状态回到 base checkpoint 的样子——这正是 run 级 rollback
+        需要的效果。base 为 None 表示空线程起点，即删除该 ns 的全部条目。
+        blobs 不删（可能仍被 base 或共享版本引用），孤儿 blob 无害。
+        返回删除的 checkpoint 条数。
+        """
+        removed = 0
+        prefix = f"{checkpoint_ns}{_SEP}"
+
+        storage_raw = await self._client.hgetall(self._storage_key(thread_id))
+        for field, _value in storage_raw.items():
+            field_text = self._decode_key(field)
+            if not field_text.startswith(prefix):
+                continue
+            checkpoint_id = field_text[len(prefix) :]
+            if base_checkpoint_id is None or checkpoint_id > base_checkpoint_id:
+                await self._client.hdel(self._storage_key(thread_id), field)
+                removed += 1
+
+        writes_raw = await self._client.hgetall(self._writes_key(thread_id))
+        for field, _value in writes_raw.items():
+            field_text = self._decode_key(field)
+            if not field_text.startswith(prefix):
+                continue
+            # field = {ns}\x00{ckpt_id}\x00{task_id}\x00{idx}
+            tail = field_text[len(prefix) :].split(_SEP)
+            checkpoint_id = tail[0] if tail else ""
+            if base_checkpoint_id is None or checkpoint_id > base_checkpoint_id:
+                await self._client.hdel(self._writes_key(thread_id), field)
+                removed += 1
+        return removed
+
     # ---- 同步接口：异步运行时下显式拒绝（与官方 Async*Saver 行为一致） ----
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
