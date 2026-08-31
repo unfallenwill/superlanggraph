@@ -1,0 +1,86 @@
+[project]
+name = "superlanggraph"
+version = "0.1.0"
+description = "自托管、生产就绪的 LangGraph 运行时：调度留官方，执行走 Redis"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "croniter>=6.2.4",
+    "fastapi>=0.141.1",
+    "langgraph>=1.2.11",
+    "pydantic-settings>=2.15.0",
+    "redis>=8.1.0",
+    "uvicorn>=0.52.4",
+]
+
+[project.scripts]
+superlanggraph = "superlanggraph.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "import-linter>=2.14",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.5",
+]
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "strict"
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+reportMissingTypeStubs = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+show-fixes = true
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle 错误
+    "W",   # pycodestyle 警告
+    "F",   # pyflakes
+    "I",   # isort：导入分组与排序
+    "UP",  # pyupgrade：跟上语言演进
+    "B",   # bugbear：常见陷阱
+    "SIM", # 扁平化与简化
+    "C4",  # 更好的容器写法
+    "RUF", # ruff 专属规则
+    "PL",  # pylint 全家桶，含 PLC0415
+]
+# PLR0913：构造函数依赖数量不受限（组合根注入是显式哲学）
+# PLR2004：测试与配置中的字面量阈值合理
+# RUF001/002/003：中文注释与文档字符串使用全角标点是正确写法，非混淆字符
+ignore = ["PLR0913", "PLR0917", "PLR2004", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.importlinter]
+root_packages = ["superlanggraph"]
+
+[[tool.importlinter.contracts]]
+name = "分层依赖方向：入口 → 接入/服务 → 基础设施 → 契约"
+type = "layers"
+layers = [
+    "superlanggraph.cli",
+    "superlanggraph.server",
+    "superlanggraph.driver | superlanggraph.worker | superlanggraph.cron",
+    "superlanggraph.broker | superlanggraph.checkpoint | superlanggraph.cache | superlanggraph.store | superlanggraph.registry",
+    "superlanggraph.api",
+    "superlanggraph.core",
+]

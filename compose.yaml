@@ -1,0 +1,67 @@
+# Infra-only dev stack: MySQL + Redis (+ adminer). The app processes run
+# locally with uv — see README.md.
+#
+# Usage:
+#   cp .env.example .env            # then fill OPENAI_API_KEY (+ AGENT_MODEL)
+#   docker compose up -d
+#   open http://localhost:8080      # adminer: browse MySQL (server "mysql")
+#   docker compose down             # add -v to also wipe MySQL data
+#
+# Secrets come from .env at runtime — nothing sensitive is baked into images.
+name: superlanggraph
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpw}
+      MYSQL_DATABASE: agent
+      MYSQL_USER: agent
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agent}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpw}"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    ports:
+      # Loopback-only: lets the locally running app checkpoint
+      # conversations; MYSQL_DSN points here.
+      - "127.0.0.1:3306:3306"
+
+  adminer:
+    # DB browser for the agent schema. Loopback-only binding:
+    # adminer is a generic SQL client, never expose it past the dev machine.
+    # Login: server "mysql", user agent (or root) — passwords from .env.
+    image: adminer:latest
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: mysql
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  redis:
+    image: redis:7.0-alpine
+    # AOF everysec: checkpoints and run state live here, so Redis must
+    # survive restarts (architecture decision D4).
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    ports:
+      # Loopback-only: tasks/events/checkpoints share this instance;
+      # REDIS_URL points here.
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  mysql-data:
+  redis-data:
