@@ -62,6 +62,42 @@ services:
       timeout: 3s
       retries: 20
 
+  otel-collector:
+    profiles: [observability]
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    command: ["--config=/etc/otel-config.yaml"]
+    configs:
+      - source: otel-config
+        target: /etc/otel-config.yaml
+    ports:
+      - "127.0.0.1:4317:4317"  # OTLP gRPC
+      - "127.0.0.1:4318:4318"  # OTLP HTTP
+      - "127.0.0.1:8889:8889"  # Prometheus 导出端点
+
+configs:
+  otel-config:
+    content: |
+      receivers:
+        otlp:
+          protocols:
+            http:
+              endpoint: 0.0.0.0:4318
+            grpc:
+              endpoint: 0.0.0.0:4317
+      exporters:
+        prometheus:
+          endpoint: 0.0.0.0:8889
+        debug:
+          verbosity: basic
+      service:
+        pipelines:
+          traces:
+            receivers: [otlp]
+            exporters: [debug]
+          metrics:
+            receivers: [otlp]
+            exporters: [prometheus]
+
 volumes:
   mysql-data:
   redis-data:

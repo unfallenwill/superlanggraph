@@ -30,6 +30,7 @@ from superlanggraph.checkpoint.redis_saver import RedisSaver
 from superlanggraph.core.settings import AuthSettings, BrokerSettings
 from superlanggraph.cron.scheduler import CronTable
 from superlanggraph.driver.runner import ControlDispatcher, RunExecutor
+from superlanggraph.observability import setup_otel
 from superlanggraph.registry.loader import Registry
 from superlanggraph.server.app import create_app
 from superlanggraph.server.runtime import ServerRuntime
@@ -109,6 +110,7 @@ def build_app(
     ``background_roles`` 指定本进程内嵌的后台循环；传空集合即为纯 HTTP 接入
     （后台角色由独立进程承担）。
     """
+    setup_otel("server")
     runtime = build_runtime(settings, config_path)
     return create_app(
         runtime,

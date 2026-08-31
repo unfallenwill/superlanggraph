@@ -8,6 +8,9 @@ dependencies = [
     "croniter>=6.2.4",
     "fastapi>=0.141.1",
     "langgraph>=1.2.11",
+    "opentelemetry-api>=1.44.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
+    "opentelemetry-sdk>=1.44.0",
     "pydantic-settings>=2.15.0",
     "redis>=8.1.0",
     "uvicorn>=0.52.4",
@@ -80,7 +83,7 @@ layers = [
     "superlanggraph.cli",
     "superlanggraph.server",
     "superlanggraph.driver | superlanggraph.worker | superlanggraph.cron",
-    "superlanggraph.broker | superlanggraph.checkpoint | superlanggraph.cache | superlanggraph.store | superlanggraph.registry",
+    "superlanggraph.broker | superlanggraph.checkpoint | superlanggraph.cache | superlanggraph.store | superlanggraph.registry | superlanggraph.observability",
     "superlanggraph.api",
     "superlanggraph.core",
 ]

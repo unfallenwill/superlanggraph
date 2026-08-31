@@ -25,6 +25,7 @@ from superlanggraph.core.errors import SlgError
 from superlanggraph.core.protocols import ControlBus, EventBus, ResultBus, TaskQueue
 from superlanggraph.cron.scheduler import CronTable, next_after, utc_now
 from superlanggraph.driver.runner import ControlDispatcher, RunExecutor
+from superlanggraph.observability import setup_otel, shutdown_otel
 from superlanggraph.registry.loader import Registry
 from superlanggraph.store.redis_store import RedisStore
 from superlanggraph.worker.executor import NodeWorker
@@ -79,6 +80,7 @@ class ServerRuntime:
         """
         faulthandler.dump_traceback_later(120, repeat=True, file=sys.stderr)
 
+        setup_otel(role="-".join(sorted(roles)))
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -87,6 +89,7 @@ class ServerRuntime:
         await self.start_background(roles)
         await stop.wait()
         await self.stop_background()
+        shutdown_otel()
 
     async def stop_background(self) -> None:
         """优雅停机：先停止接收新 run，等在途 run 到终态（有上限），

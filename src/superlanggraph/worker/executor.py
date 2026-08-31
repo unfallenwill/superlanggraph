@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+import time
 from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
@@ -31,6 +32,8 @@ from superlanggraph.core.envelope import Envelope
 from superlanggraph.core.protocols import EventBus, ResultBus, TaskQueue
 from superlanggraph.core.serde import dumps_json_text
 from superlanggraph.core.task_codec import NodeOutcome, NodeTask, decode_task, encode_outcome
+from superlanggraph.observability import extract_from_envelope, tracer
+from superlanggraph.observability import meter as get_meter
 from superlanggraph.registry.loader import Registry
 
 
@@ -95,6 +98,10 @@ class NodeWorker:
         self._events = events
         # 官方 stream_writer 是同步回调：事件先进内存队列，由排水任务写 Redis。
         self._outbox: asyncio.Queue[Envelope] = asyncio.Queue()
+        self._tracer = tracer("superlanggraph.worker")
+        self._task_duration = get_meter("superlanggraph.worker").create_histogram(
+            "slg.task.duration", unit="s", description="节点任务执行时长"
+        )
 
     async def serve_forever(self, lease_seconds: float = 30.0) -> None:
         """主循环：领取任务 → 执行 → 发布结果 → 确认；同时排水事件队列、
@@ -140,6 +147,7 @@ class NodeWorker:
             await self._handle_envelope(envelope, ack_receipt=receipt)
 
     async def _handle_envelope(self, envelope: Envelope, *, ack_receipt: str) -> None:
+        context = extract_from_envelope(envelope)
         try:
             task = decode_task(envelope.payload)
         except Exception as exc:
@@ -156,7 +164,22 @@ class NodeWorker:
             )
             await self._tasks.ack_task(ack_receipt)
             return
-        outcome = await self._execute_safely(task)
+        started = time.monotonic()
+        with self._tracer.start_as_current_span(
+            "task.execute",
+            context=context,
+            attributes={
+                "run.id": envelope.run_id,
+                "task.id": envelope.task_id or "",
+                "task.node": task.node,
+                "graph.id": task.graph_id,
+            },
+        ) as span:
+            outcome = await self._execute_safely(task)
+            span.set_attribute("task.outcome", outcome.kind)
+            if outcome.error_text:
+                span.set_attribute("task.error", outcome.error_text[:200])
+            self._task_duration.record(time.monotonic() - started, {"task.node": task.node})
         await self._results.publish_result(
             envelope.run_id,
             Envelope(

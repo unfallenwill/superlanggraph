@@ -25,6 +25,7 @@ from langgraph._internal._constants import (
 )
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
+from opentelemetry import propagate
 
 from superlanggraph.broker.runs import RunStore
 from superlanggraph.checkpoint.redis_saver import RedisSaver
@@ -32,6 +33,7 @@ from superlanggraph.core.envelope import Envelope
 from superlanggraph.core.protocols import ControlBus, EventBus, ResultBus, TaskQueue
 from superlanggraph.core.serde import dumps_json_text
 from superlanggraph.core.task_codec import NodeOutcome, NodeTask, decode_outcome, encode_task
+from superlanggraph.observability import inject_into_envelope, tracer
 from superlanggraph.registry.loader import Registry
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,7 @@ class RunSpec:
     interrupt_before: tuple[str, ...] | None = None
     interrupt_after: tuple[str, ...] | None = None
     durability: str | None = None
+    trace_context: dict[str, str] | None = None
 
 
 class RunExecutor:
@@ -99,6 +102,7 @@ class RunExecutor:
         self._events = events
         self._store = store
         self._pending: dict[tuple[str, str], asyncio.Future[NodeOutcome]] = {}
+        self._tracer = tracer("superlanggraph.driver")
 
     async def execute_node(
         self,
@@ -120,29 +124,29 @@ class RunExecutor:
         resume_map = cast("dict[str, Any]", conf.get(CONFIG_KEY_RESUME_MAP) or {})
         fut: asyncio.Future[NodeOutcome] = asyncio.get_running_loop().create_future()
         self._pending[(run_id, task_id)] = fut
-        await self._tasks.enqueue_task(
-            Envelope(
-                type="task",
-                run_id=run_id,
-                task_id=task_id,
-                payload=encode_task(
-                    NodeTask(
-                        task_id=task_id,
-                        graph_id=graph_id,
-                        node=node,
-                        run_id=run_id,
-                        thread_id=thread_id,
-                        checkpoint_ns=checkpoint_ns,
-                        input=input,
-                        resume=list(scratchpad.resume) if scratchpad else [],
-                        null_resume=(scratchpad.get_null_resume(False) if scratchpad else None),
-                        resume_map=resume_map,
-                        metadata=(config or {}).get("metadata") or {},
-                        tags=(config or {}).get("tags") or [],
-                    )
-                ),
-            )
+        envelope = Envelope(
+            type="task",
+            run_id=run_id,
+            task_id=task_id,
+            payload=encode_task(
+                NodeTask(
+                    task_id=task_id,
+                    graph_id=graph_id,
+                    node=node,
+                    run_id=run_id,
+                    thread_id=thread_id,
+                    checkpoint_ns=checkpoint_ns,
+                    input=input,
+                    resume=list(scratchpad.resume) if scratchpad else [],
+                    null_resume=(scratchpad.get_null_resume(False) if scratchpad else None),
+                    resume_map=resume_map,
+                    metadata=(config or {}).get("metadata") or {},
+                    tags=(config or {}).get("tags") or [],
+                )
+            ),
         )
+        envelope = inject_into_envelope(envelope)
+        await self._tasks.enqueue_task(envelope)
         outcome = await fut
         self._pending.pop((run_id, task_id), None)
         return await self._apply_outcome(outcome, scratchpad, send)
@@ -152,49 +156,63 @@ class RunExecutor:
         drain = asyncio.create_task(self._drain_results(spec.run_id))
         heartbeat = asyncio.create_task(self._heartbeat_loop(spec.run_id))
         interrupted = False
-        try:
-            await self._store.update(spec.run_id, status="running")
-            graph = self._registry.compile_distributed(
-                spec.graph_id, self, checkpointer=self._saver
-            )
-            config: RunnableConfig = {
-                "configurable": {
-                    "thread_id": spec.thread_id,
-                    "checkpoint_ns": "",
-                    "run_id": spec.run_id,
-                    **spec.extra_configurable,
+        carrier = dict(spec.trace_context or {})
+        with self._tracer.start_as_current_span(
+            "run.execute",
+            context=propagate.extract(carrier),
+            attributes={
+                "run.id": spec.run_id,
+                "thread.id": spec.thread_id,
+                "graph.id": spec.graph_id,
+            },
+        ):
+            try:
+                await self._store.update(spec.run_id, status="running")
+                graph = self._registry.compile_distributed(
+                    spec.graph_id, self, checkpointer=self._saver
+                )
+                config: RunnableConfig = {
+                    "configurable": {
+                        "thread_id": spec.thread_id,
+                        "checkpoint_ns": "",
+                        "run_id": spec.run_id,
+                        **spec.extra_configurable,
+                    }
                 }
-            }
-            graph_input = _build_graph_input(spec)
-            async for chunk in graph.astream(
-                graph_input,
-                config=config,
-                interrupt_before=spec.interrupt_before,
-                interrupt_after=spec.interrupt_after,
-                durability=cast("Any", spec.durability) if spec.durability else None,
-                stream_mode=list(_STREAM_MODES),
-                subgraphs=True,
-            ):
-                ns, mode, data = cast("tuple[tuple[str, ...], str, Any]", chunk)
-                # 官方把挂起信号以 __interrupt__ 键放进 dict 输出（values/updates
-                # 皆可），键存在即视为中断挂起，与具体模式无关。
-                data_dict = cast("dict[str, Any]", data) if isinstance(data, dict) else None
-                if data_dict is not None and "__interrupt__" in data_dict:
-                    interrupted = True
-                await self._emit(spec.run_id, mode, ns, data)
-            await self._finish(
-                spec.run_id, spec.thread_id, "interrupted" if interrupted else "success"
-            )
-        except asyncio.CancelledError:
-            await self._finish(spec.run_id, spec.thread_id, "interrupted")
-        except Exception as exc:
-            await self._emit_text(spec.run_id, "error", {"error": repr(exc), "message": str(exc)})
-            await self._finish(spec.run_id, spec.thread_id, "error", error=repr(exc))
-        finally:
-            heartbeat.cancel()
-            drain.cancel()
-            for key in [k for k in self._pending if k[0] == spec.run_id]:
-                self._pending.pop(key, None)
+                graph_input = _build_graph_input(spec)
+                async for chunk in graph.astream(
+                    graph_input,
+                    config=config,
+                    interrupt_before=spec.interrupt_before,
+                    interrupt_after=spec.interrupt_after,
+                    durability=cast("Any", spec.durability) if spec.durability else None,
+                    stream_mode=list(_STREAM_MODES),
+                    subgraphs=True,
+                ):
+                    ns, mode, data = cast("tuple[tuple[str, ...], str, Any]", chunk)
+                    # 官方把挂起信号以 __interrupt__ 键放进 dict 输出（values/updates
+                    # 皆可），键存在即视为中断挂起，与具体模式无关。
+                    data_dict = cast("dict[str, Any]", data) if isinstance(data, dict) else None
+                    if data_dict is not None and "__interrupt__" in data_dict:
+                        interrupted = True
+                    await self._emit(spec.run_id, mode, ns, data)
+                await self._finish(
+                    spec.run_id,
+                    spec.thread_id,
+                    "interrupted" if interrupted else "success",
+                )
+            except asyncio.CancelledError:
+                await self._finish(spec.run_id, spec.thread_id, "interrupted")
+            except Exception as exc:
+                await self._emit_text(
+                    spec.run_id, "error", {"error": repr(exc), "message": str(exc)}
+                )
+                await self._finish(spec.run_id, spec.thread_id, "error", error=repr(exc))
+            finally:
+                for key in [k for k in self._pending if k[0] == spec.run_id]:
+                    self._pending.pop(key, None)
+        heartbeat.cancel()
+        drain.cancel()
 
     async def _heartbeat_loop(self, run_id: str) -> None:
         """driver 心跳：守尸据此区分「在跑」与「孤儿」。"""
@@ -291,9 +309,9 @@ class ControlDispatcher:
                 if kind == "start":
                     if self.draining:
                         continue
-                    await self._start(envelope.payload)
+                    await self._start(envelope)
                 elif kind == "cancel":
-                    await self._cancel(envelope.payload)
+                    await self._cancel(envelope)
         finally:
             reaper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -335,18 +353,23 @@ class ControlDispatcher:
             logger.warning("认领孤儿 run %s（线程 %s），从 checkpoint 恢复", run_id, thread_id)
             await self._store.update(run_id, status="pending")
             await self._start(
-                {
-                    "kind": "start",
-                    "run_id": run_id,
-                    "thread_id": thread_id,
-                    "graph_id": record["graph_id"],
-                    "input": record.get("input"),
-                    "command": record.get("command"),
-                    "extra_configurable": {},
-                }
+                Envelope(
+                    type="control",
+                    run_id=run_id,
+                    payload={
+                        "kind": "start",
+                        "run_id": run_id,
+                        "thread_id": thread_id,
+                        "graph_id": record["graph_id"],
+                        "input": record.get("input"),
+                        "command": record.get("command"),
+                        "extra_configurable": {},
+                    },
+                )
             )
 
-    async def _start(self, payload: dict[str, Any]) -> None:
+    async def _start(self, envelope: Envelope) -> None:
+        payload = envelope.payload
         thread_id = str(payload["thread_id"])
         spec = RunSpec(
             run_id=str(payload["run_id"]),
@@ -358,6 +381,7 @@ class ControlDispatcher:
             interrupt_before=_as_node_tuple(payload.get("interrupt_before")),
             interrupt_after=_as_node_tuple(payload.get("interrupt_after")),
             durability=payload.get("durability"),
+            trace_context=dict(envelope.trace or {}),
         )
         run_id = spec.run_id
         previous = self._thread_tasks.get(thread_id)
@@ -395,7 +419,8 @@ class ControlDispatcher:
         if task is not None and not task.done():
             task.cancel()
 
-    async def _cancel(self, payload: dict[str, Any]) -> None:
+    async def _cancel(self, envelope: Envelope) -> None:
+        payload = envelope.payload
         run_id = str(payload["run_id"])
         thread_id = str(payload["thread_id"])
         action = str(payload.get("action", "interrupt"))

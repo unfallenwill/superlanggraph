@@ -58,6 +58,20 @@ uv run lint-imports   # 分层依赖方向合同
 uv run pytest         # 单元 + 集成（需 docker compose up -d redis）+ e2e 验收
 ```
 
+## 可观测性（OpenTelemetry）
+
+设置 `OTEL_EXPORTER_OTLP_ENDPOINT` 即启用 traces + metrics 导出（OTLP/HTTP）；
+未设置时整库 no-op，零开销。每个角色进程是独立的 `service.name`
+（`superlanggraph-server` / `-driver` / `-worker`），W3C TraceContext 经
+Envelope 跨进程贯通——HTTP 入口到远程节点执行是一条完整 trace。
+
+本地起 collector + Prometheus（P2 可观测）：
+
+```bash
+docker compose --profile observability up -d otel-collector
+# Prometheus 抓取端点: http://127.0.0.1:8889/metrics
+```
+
 ## 配置
 
 环境变量前缀 `SLG_`（见 `core/settings.py`）：`SLG_REDIS_URL`、`SLG_STREAM_PREFIX`、
