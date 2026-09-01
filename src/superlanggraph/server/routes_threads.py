@@ -114,7 +114,37 @@ async def create_thread(request: Request) -> dict[str, Any]:
         "updated_at": _now(),
     }
     await runtime.redis.hset(_thread_key(thread_id), mapping=record)  # type: ignore[arg-type]
+    supersteps = payload.get("supersteps")
+    if supersteps:
+        await _import_supersteps(runtime, thread_id, supersteps)
     return _thread_json(runtime, thread_id, record)
+
+
+async def _import_supersteps(runtime: ServerRuntime, thread_id: str, supersteps: Any) -> None:
+    """线程导入：把 supersteps 序列逐条回放进检查点链。
+
+    每条 update（values + as_node）经官方 ``aupdate_state`` 落成真实
+    checkpoint——后续 resume / 时间旅行 / get_history 全部走官方机制。
+    """
+    if not isinstance(supersteps, list):
+        raise HTTPException(422, "supersteps 必须是列表")
+    graph_id = await _graph_id_for_thread(runtime, thread_id)
+    graph = runtime.registry.compile_local(graph_id, checkpointer=runtime.saver)
+    config: dict[str, Any] = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    try:
+        steps = cast("list[dict[str, Any]]", supersteps)
+        for step in steps:
+            updates = cast("list[dict[str, Any]]", step.get("updates") or [])
+            for update in updates:
+                values = cast("dict[str, Any] | None", update.get("values"))
+                if values is None:
+                    continue
+                as_node = cast("str | None", update.get("as_node"))
+                await graph.aupdate_state(config, values, as_node=as_node)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, f"supersteps 导入失败: {exc}") from exc
 
 
 def _thread_json(runtime: ServerRuntime, thread_id: str, record: dict[str, Any]) -> dict[str, Any]:

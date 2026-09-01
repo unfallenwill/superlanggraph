@@ -51,3 +51,26 @@ async def test_list_select_projection(client: Any) -> None:
     assert runs, "至少有一条 run"
     assert set(runs[0].keys()) <= {"run_id", "status"}
     _ = run
+
+
+async def test_supersteps_import(server_url: str, client: Any) -> None:
+    """threads.create(supersteps=...) 导入历史：状态可查、可从任意点继续执行。"""
+    thread_id = (await client.threads.create())["thread_id"]
+    await client.threads.create(
+        thread_id=thread_id,
+        if_exists="do_nothing",
+        supersteps=[
+            {"updates": [{"values": {"count": 5}, "as_node": "double"}]},
+            {"updates": [{"values": {"count": 11}, "as_node": "double"}]},
+        ],
+    )
+
+    state = await client.threads.get_state(thread_id)
+    assert state["values"]["count"] == 11
+
+    history = await client.threads.get_history(thread_id)
+    assert len(history) >= 2, "导入的 superstep 应生成检查点历史"
+
+    # 从导入的 checkpoint 继续：覆盖 input 跑一轮 agent（11*2+1=23）
+    result = await client.runs.wait(thread_id, "agent", input={"count": 11})
+    assert result["count"] == 23
