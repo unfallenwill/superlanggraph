@@ -25,7 +25,8 @@ from superlanggraph.core.errors import SlgError
 from superlanggraph.core.protocols import ControlBus, EventBus, ResultBus, TaskQueue
 from superlanggraph.cron.scheduler import CronTable, next_after, utc_now
 from superlanggraph.driver.runner import ControlDispatcher, RunExecutor
-from superlanggraph.observability import setup_otel, shutdown_otel
+from superlanggraph.observability import inject_into_envelope, setup_otel, shutdown_otel
+from superlanggraph.observability.metrics import make_metrics_collector
 from superlanggraph.registry.loader import Registry
 from superlanggraph.store.redis_store import RedisStore
 from superlanggraph.worker.executor import NodeWorker
@@ -60,7 +61,7 @@ class ServerRuntime:
         角色映射：driver→控制分发、worker→节点执行、cron→定时调度；
         server 角色本身没有后台循环（纯 HTTP 接入）。
         """
-        enabled = roles if roles else {"server", "driver", "worker", "cron"}
+        enabled = roles if roles else {"server", "driver", "worker", "cron", "metrics"}
         if "driver" in enabled:
             self._background.append(
                 asyncio.create_task(self.dispatcher.serve_forever(), name="slg-dispatcher")
@@ -71,6 +72,20 @@ class ServerRuntime:
             )
         if "cron" in enabled:
             self._background.append(asyncio.create_task(self._cron_loop(), name="slg-cron"))
+        if "metrics" in enabled:
+            self._background.append(asyncio.create_task(self._metrics_loop(), name="slg-metrics"))
+
+    async def _metrics_loop(self) -> None:
+        """周期采集运维指标（队列/PEL/活跃 run），经 OTel 导出。"""
+        collector = make_metrics_collector(self.redis, "slg", "drivers")
+        while True:
+            try:
+                await collector()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(10.0)
 
     async def serve_roles(self, roles: set[str]) -> None:
         """无 HTTP 的纯后台角色入口（driver / worker / cron 独立进程部署）。
@@ -200,24 +215,24 @@ class ServerRuntime:
         )
         await self.ensure_thread(thread_id)
         await self.redis.set(f"slg:thread-graph:{thread_id}", assistant["graph_id"])
-        await self.control.publish_control(
-            Envelope(
-                type="control",
-                run_id=record["run_id"],
-                payload={
-                    "kind": "start",
-                    "run_id": record["run_id"],
-                    "thread_id": thread_id,
-                    "graph_id": assistant["graph_id"],
-                    "input": input,
-                    "command": command,
-                    "extra_configurable": extra_configurable or {},
-                    "interrupt_before": list(interrupt_before) if interrupt_before else None,
-                    "interrupt_after": list(interrupt_after) if interrupt_after else None,
-                    "durability": durability,
-                },
-            )
+        ctrl = Envelope(
+            type="control",
+            run_id=record["run_id"],
+            payload={
+                "kind": "start",
+                "run_id": record["run_id"],
+                "thread_id": thread_id,
+                "graph_id": assistant["graph_id"],
+                "input": input,
+                "command": command,
+                "extra_configurable": extra_configurable or {},
+                "interrupt_before": list(interrupt_before) if interrupt_before else None,
+                "interrupt_after": list(interrupt_after) if interrupt_after else None,
+                "durability": durability,
+            },
         )
+        inject_into_envelope(ctrl)
+        await self.control.publish_control(ctrl)
         return record
 
     async def _wait_active_clear(self, thread_id: str, timeout: float = 5.0) -> None:
