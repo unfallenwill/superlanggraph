@@ -1,0 +1,74 @@
+# 部署用 Docker Compose：对齐官方 langgraph up 体验。
+#
+# 用法（在包含 langgraph.json + 图源文件的项目目录下）：
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# 两种模式：
+#   默认（单容器）：server 进程内嵌 driver + worker + cron（与 langgraph dev 一致）
+#   多容器（生产）：SLG_ROLES="" 的 server + 独立 driver + 独立 worker，各自伸缩
+#
+# 环境变量：
+#   SLG_AUTH_API_KEYS  — 逗号分隔的 api key（空则不启用鉴权）
+#   SLG_ENV            — 部署环境标识（默认 dev）
+#
+# 用户代码挂载：./langgraph.json + ./*.py 挂载到容器 /app/user/
+
+x-slg-base: &slg-base
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  env_file: .env
+  environment: &slg-env
+    SLG_AUTH_API_KEYS: ${SLG_AUTH_API_KEYS:-}
+    SLG_ENV: ${SLG_ENV:-dev}
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  volumes:
+    - ./langgraph.json:/app/user/langgraph.json:ro
+    - ./*.py:/app/user/:ro
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:7.0-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # 单容器全角色（默认启动，对齐 langgraph dev）
+  server:
+    <<: *slg-base
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *slg-env
+      SLG_ROLES: "driver,worker,cron"
+
+  # 多容器生产模式：取消注释按角色伸缩
+  # driver:
+  #   <<: *slg-base
+  #   command: ["driver", "--config", "/app/user/langgraph.json"]
+  #
+  # worker:
+  #   <<: *slg-base
+  #   command: ["worker", "--config", "/app/user/langgraph.json"]
+  #   deploy:
+  #     replicas: 3
+  #
+  # server-standalone:
+  #   <<: *slg-base
+  #   command: ["server", "--port", "8000", "--config", "/app/user/langgraph.json", "--roles", ""]
+  #   ports:
+  #     - "8000:8000"
+
+volumes:
+  redis-data:

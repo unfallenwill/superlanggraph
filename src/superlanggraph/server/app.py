@@ -7,6 +7,7 @@ create_app 只接收装配完成的 ServerRuntime（由组合根构造），挂�
 from __future__ import annotations
 
 from types import TracebackType
+
 from fastapi import Depends, FastAPI, HTTPException, Request
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 

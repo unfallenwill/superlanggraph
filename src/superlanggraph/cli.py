@@ -6,17 +6,19 @@
 
 - ``server``：HTTP 接入 + 可选内嵌后台循环（``--roles`` 控制），单机模式默认全角色；
 - ``driver`` / ``worker`` / ``cron``：无 HTTP 的纯后台进程，独立部署、独立伸缩。
+- ``up``：Docker Compose 一键部署（对齐官方 ``langgraph up``）。
 
     superlanggraph server [--roles driver,worker,cron]
-    superlanggraph driver   # 纯调度进程
-    superlanggraph worker   # 纯执行进程
-    superlanggraph cron     # 纯定时调度进程
+    superlanggraph up      # Docker Compose 一键部署
+    superlanggraph driver  # 纯调度进程
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -37,36 +39,84 @@ from superlanggraph.server.runtime import ServerRuntime
 from superlanggraph.store.redis_store import RedisStore
 from superlanggraph.worker.executor import NodeWorker
 
-_ROLES = ("server", "driver", "worker", "cron")
+_ROLES = ("server", "driver", "worker", "cron", "up")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """解析角色参数并启动对应服务。"""
     parser = argparse.ArgumentParser(prog="superlanggraph", description="自托管 LangGraph 运行时")
-    parser.add_argument("role", choices=_ROLES, help="要启动的角色")
-    parser.add_argument("--host", default="127.0.0.1", help="server 角色的监听地址")
-    parser.add_argument("--port", type=int, default=8000, help="server 角色的监听端口")
-    parser.add_argument("--config", default="langgraph.json", help="langgraph.json 路径")
-    parser.add_argument(
+    sub = parser.add_subparsers(dest="command")
+
+    server_parser = sub.add_parser("server", help="启动 HTTP 服务（可内嵌后台角色）")
+    server_parser.add_argument("--host", default="0.0.0.0", help="监听地址")
+    server_parser.add_argument("--port", type=int, default=8000, help="监听端口")
+    server_parser.add_argument("--config", default="langgraph.json", help="langgraph.json 路径")
+    server_parser.add_argument(
         "--roles",
         default="driver,worker,cron",
-        help="server 进程内嵌的后台循环，逗号分隔（默认全部内嵌，单机模式）",
+        help="内嵌后台循环，逗号分隔（默认全部内嵌，单机模式）",
     )
+
+    up_parser = sub.add_parser("up", help="Docker Compose 一键部署（对齐 langgraph up）")
+    up_parser.add_argument("--port", type=int, default=8000, help="对外端口")
+    up_parser.add_argument("--detach", action="store_true", help="后台运行")
+    up_parser.add_argument(
+        "--compose-file",
+        default=str(Path(__file__).resolve().parents[3] / "deploy" / "docker-compose.yml"),
+        help="部署用 compose 文件路径",
+    )
+
+    for role in ("driver", "worker", "cron"):
+        role_parser = sub.add_parser(role, help=f"纯 {role} 后台进程")
+        role_parser.add_argument("--config", default="langgraph.json", help="langgraph.json 路径")
+
     args = parser.parse_args(argv)
 
-    settings = BrokerSettings()
-    config_path = Path(args.config)
-
-    if args.role == "server":
+    if args.command == "server":
+        settings = BrokerSettings()
         roles = {part.strip() for part in args.roles.split(",") if part.strip()}
-        app = build_app(settings, config_path, background_roles=roles)
+        app = build_app(settings, Path(args.config), background_roles=roles)
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
-    if args.role in ("driver", "worker", "cron"):
-        asyncio.run(serve_background_role(settings, config_path, args.role))
+    if args.command == "up":
+        return _run_up(args)
+    if args.command in ("driver", "worker", "cron"):
+        settings = BrokerSettings()
+        asyncio.run(serve_background_role(settings, Path(args.config), args.command))
         return 0
-    parser.error(f"未知角色: {args.role}")
+    parser.print_help()
     return 1
+
+
+def _run_up(args: argparse.Namespace) -> int:
+    """Docker Compose 一键部署：封装 compose up 并透传端口/配置。"""
+    config_path = Path(args.config).resolve()
+    if not config_path.exists():
+        print(f"找不到 {config_path}，请先在项目根目录准备 langgraph.json", file=sys.stderr)
+        return 1
+
+    compose_file = Path(args.compose_file).resolve()
+    if not compose_file.exists():
+        print(f"找不到 compose 文件: {compose_file}", file=sys.stderr)
+        return 1
+
+    cmd: list[str] = [
+        "docker",
+        "compose",
+        "-f",
+        str(compose_file),
+        "-p",
+        "superlanggraph",
+        "--project-directory",
+        str(config_path.parent),
+        "up",
+    ]
+    if args.detach:
+        cmd.append("-d")
+
+    print(f"superlanggraph up（config: {config_path}）", flush=True)
+    result = subprocess.run(cmd)
+    return result.returncode
 
 
 def build_runtime(settings: BrokerSettings, config_path: Path) -> ServerRuntime:
