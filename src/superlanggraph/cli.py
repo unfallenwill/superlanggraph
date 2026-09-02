@@ -151,7 +151,11 @@ def _run_up(args: argparse.Namespace) -> int:
 
 def build_runtime(settings: BrokerSettings, config_path: Path) -> ServerRuntime:
     """组合根装配：绑定全部具体实现，构造 ServerRuntime。"""
-    client = aioredis.from_url(settings.redis_url, socket_connect_timeout=5.0)
+    client = aioredis.from_url(
+        settings.redis_url,
+        socket_connect_timeout=5.0,
+        max_connections=settings.redis_max_connections,
+    )
     broker = RedisBroker(settings, client)
     saver = RedisSaver(client)
     runs = RunStore(client, prefix=settings.stream_prefix)
@@ -160,7 +164,7 @@ def build_runtime(settings: BrokerSettings, config_path: Path) -> ServerRuntime:
     registry = Registry(config_path)
     executor = RunExecutor(registry, saver, broker, broker, broker, runs)
     dispatcher = ControlDispatcher(executor, runs, saver, broker)
-    worker = NodeWorker(registry, broker, broker, broker)
+    worker = NodeWorker(registry, broker, broker, broker, concurrency=settings.worker_concurrency)
     return ServerRuntime(
         redis=client,
         registry=registry,

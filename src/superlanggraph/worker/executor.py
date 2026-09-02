@@ -91,11 +91,15 @@ class NodeWorker:
         tasks: TaskQueue,
         results: ResultBus,
         events: EventBus,
+        concurrency: int = 32,
     ) -> None:
         self._registry = registry
         self._tasks = tasks
         self._results = results
         self._events = events
+        # 单 worker 进程内的任务并发度：dequeue 前先占槽，避免无界并发。
+        self._slots = asyncio.Semaphore(concurrency)
+        self._inflight: set[asyncio.Task[None]] = set()
         # 官方 stream_writer 是同步回调：事件先进内存队列，由排水任务写 Redis。
         self._outbox: asyncio.Queue[Envelope] = asyncio.Queue()
         self._tracer = tracer("superlanggraph.worker")
@@ -116,6 +120,9 @@ class NodeWorker:
             for background in (reclaimer, drain):
                 with contextlib.suppress(asyncio.CancelledError):
                     await background
+            # 优雅停机：等在飞任务收尾，未 ack 的由 XAUTOCLAIM 兜底。
+            if self._inflight:
+                await asyncio.gather(*self._inflight, return_exceptions=True)
 
     async def _drain_outbox(self) -> None:
         while True:
@@ -137,18 +144,30 @@ class NodeWorker:
     async def _serve_loop(self, lease_seconds: float) -> None:
         while True:
             try:
+                # 先占槽再 dequeue：满载时消息留在队列里给其他 worker。
+                await self._slots.acquire()
+            except asyncio.CancelledError:
+                raise
+            try:
                 lease = await self._tasks.dequeue_task(lease_seconds)
             except Exception:
+                self._slots.release()
                 await asyncio.sleep(0.5)
                 continue
             if lease is None:
+                self._slots.release()
                 continue
             receipt, envelope = lease
-            try:
-                await self._handle_envelope(envelope, ack_receipt=receipt)
-            except Exception:
-                # 单任务处理失败不应中断消费循环；消息未 ack 会被重新投递。
-                await asyncio.sleep(0.5)
+            worker_task = asyncio.create_task(self._handle_envelope(envelope, ack_receipt=receipt))
+            self._inflight.add(worker_task)
+            worker_task.add_done_callback(self._on_inflight_done)
+
+    def _on_inflight_done(self, task: asyncio.Task[None]) -> None:
+        self._inflight.discard(task)
+        self._slots.release()
+        # 检索并吞掉异常，避免未取回警告；单任务失败由未 ack 重投兜底。
+        with contextlib.suppress(Exception):
+            task.result()
 
     async def _handle_envelope(self, envelope: Envelope, *, ack_receipt: str) -> None:
         context = extract_from_envelope(envelope)

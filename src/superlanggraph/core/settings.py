@@ -13,6 +13,8 @@ class BrokerSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SLG_", env_file=".env", extra="ignore")
 
     redis_url: str = "redis://localhost:6379/0"
+    redis_max_connections: int = 2000
+    worker_concurrency: int = 32
     stream_prefix: str = "slg"
     consumer_group: str = "drivers"
     event_maxlen: int = 10_000
