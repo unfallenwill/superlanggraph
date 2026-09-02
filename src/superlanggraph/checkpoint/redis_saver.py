@@ -8,6 +8,12 @@
   value = JSON ``[type, b64]``，空值写 ``["empty", ""]``
 - ``{prefix}:writes:{thread_id}``   Hash  field = ``{ns}\\x00{ckpt_id}\\x00{task_id}\\x00{idx}``
   value = JSON ``[task_id, channel, type, b64, task_path]``
+- ``{prefix}:refs:{thread_id}``     Hash  field = 同 blobs field，value = 引用计数
+
+CoW 语义：``aput`` 只写 ``new_versions`` 涉及的 blob，未变化 channel 由
+checkpoint 清单引用既有 blob 复用。blob 生命周期由引用计数管理：checkpoint
+写入时对其引用的全部 blob 递增，删除时（回滚）经 Lua 原子扣减，减到零即删；
+``gc_thread`` 提供 mark-sweep 兜底修正计数漂移。失效方向是泄漏而非误删。
 
 checkpoint_id 字典序即时间序（官方约定），排序语义与 MemorySaver 一致。
 仅实现异步接口（agraph 运行时只用 a* 系列），同步接口显式拒绝。
@@ -37,6 +43,16 @@ from redis.asyncio import Redis
 
 _SEP: Final = "\x00"
 _EMPTY: Final = "empty"
+
+# 引用扣减 + 归零即删必须原子：先扣后删分两步会在并发写入时误删活 blob。
+_DECREF_LUA = """
+local next = redis.call('HINCRBY', KEYS[1], ARGV[1], ARGV[2])
+if next <= 0 then
+    redis.call('HDEL', KEYS[1], ARGV[1])
+    redis.call('HDEL', KEYS[2], ARGV[1])
+end
+return next
+"""
 
 
 def _b64(raw: bytes) -> str:
@@ -127,13 +143,6 @@ class RedisSaver(BaseCheckpointSaver[str]):
         checkpoint_ns: str = conf["checkpoint_ns"]
         values = checkpoint["channel_values"]
         inner = {k: v for k, v in checkpoint.items() if k != "channel_values"}
-        for channel, version in new_versions.items():
-            typed = self.serde.dumps_typed(values[channel]) if channel in values else (_EMPTY, b"")
-            await self._client.hset(
-                self._blobs_key(thread_id),
-                self._blob_field(checkpoint_ns, channel, str(version)),
-                json.dumps([typed[0], _b64(typed[1])]),
-            )
         cp_typed = self.serde.dumps_typed(cast("dict[str, Any]", inner))
         md_typed = self.serde.dumps_typed(get_checkpoint_metadata(config, metadata))
         entry = [
@@ -143,11 +152,27 @@ class RedisSaver(BaseCheckpointSaver[str]):
             _b64(md_typed[1]),
             conf.get("checkpoint_id"),
         ]
-        await self._client.hset(
-            self._storage_key(thread_id),
-            self._entry_field(checkpoint_ns, checkpoint["id"]),
-            json.dumps(entry),
-        )
+        # 单事务落盘：blob 写入、引用计数递增（对所有被引用版本，含从父
+        # checkpoint 带过来的未变化 channel）与清单写入同生共死。
+        refs_key = self._refs_key(thread_id)
+        async with self._client.pipeline(transaction=True) as pipe:
+            for channel, version in new_versions.items():
+                typed = (
+                    self.serde.dumps_typed(values[channel]) if channel in values else (_EMPTY, b"")
+                )
+                pipe.hset(
+                    self._blobs_key(thread_id),
+                    self._blob_field(checkpoint_ns, channel, str(version)),
+                    json.dumps([typed[0], _b64(typed[1])]),
+                )
+            for channel, version in checkpoint["channel_versions"].items():
+                pipe.hincrby(refs_key, self._blob_field(checkpoint_ns, channel, str(version)), 1)
+            pipe.hset(
+                self._storage_key(thread_id),
+                self._entry_field(checkpoint_ns, checkpoint["id"]),
+                json.dumps(entry),
+            )
+            await pipe.execute()
         return {
             "configurable": {
                 "thread_id": thread_id,
@@ -183,6 +208,7 @@ class RedisSaver(BaseCheckpointSaver[str]):
             self._storage_key(thread_id),
             self._blobs_key(thread_id),
             self._writes_key(thread_id),
+            self._refs_key(thread_id),
         )
 
     async def adelete_checkpoints_after(
@@ -195,34 +221,93 @@ class RedisSaver(BaseCheckpointSaver[str]):
 
         语义：线程状态回到 base checkpoint 的样子——这正是 run 级 rollback
         需要的效果。base 为 None 表示空线程起点，即删除该 ns 的全部条目。
-        blobs 不删（可能仍被 base 或共享版本引用），孤儿 blob 无害。
+        被删 checkpoint 对 blob 的引用经 Lua 原子扣减，减到零的 blob 随即
+        删除（已无任何清单引用它）；仍被存活清单引用的共享 blob 保留。
         返回删除的 checkpoint 条数。
         """
-        removed = 0
-        prefix = f"{checkpoint_ns}{_SEP}"
-
-        storage_raw = await self._client.hgetall(self._storage_key(thread_id))
-        for field, _value in storage_raw.items():
-            field_text = self._decode_key(field)
-            if not field_text.startswith(prefix):
-                continue
-            checkpoint_id = field_text[len(prefix) :]
-            if base_checkpoint_id is None or checkpoint_id > base_checkpoint_id:
-                await self._client.hdel(self._storage_key(thread_id), field)
-                removed += 1
+        entries = await self._load_entries(thread_id, checkpoint_ns)
+        doomed = [
+            (checkpoint_id, entry)
+            for checkpoint_id, entry in entries.items()
+            if base_checkpoint_id is None or checkpoint_id > base_checkpoint_id
+        ]
+        if not doomed:
+            return 0
+        removed = len(doomed)
+        doomed_ids = {checkpoint_id for checkpoint_id, _entry in doomed}
 
         writes_raw = await self._client.hgetall(self._writes_key(thread_id))
+        write_prefix = f"{checkpoint_ns}{_SEP}"
+        write_fields_by_ckpt: dict[str, list[str]] = {}
         for field, _value in writes_raw.items():
             field_text = self._decode_key(field)
-            if not field_text.startswith(prefix):
+            if not field_text.startswith(write_prefix):
                 continue
             # field = {ns}\x00{ckpt_id}\x00{task_id}\x00{idx}
-            tail = field_text[len(prefix) :].split(_SEP)
-            checkpoint_id = tail[0] if tail else ""
-            if base_checkpoint_id is None or checkpoint_id > base_checkpoint_id:
-                await self._client.hdel(self._writes_key(thread_id), field)
-                removed += 1
+            checkpoint_id = field_text[len(write_prefix) :].split(_SEP)[0]
+            if checkpoint_id in doomed_ids:
+                write_fields_by_ckpt.setdefault(checkpoint_id, []).append(field_text)
+
+        refs_key = self._refs_key(thread_id)
+        blobs_key = self._blobs_key(thread_id)
+        async with self._client.pipeline(transaction=True) as pipe:
+            for checkpoint_id, entry in doomed:
+                pipe.hdel(
+                    self._storage_key(thread_id),
+                    self._entry_field(checkpoint_ns, checkpoint_id),
+                )
+                for field_text in write_fields_by_ckpt.get(checkpoint_id, []):
+                    pipe.hdel(self._writes_key(thread_id), field_text)
+                checkpoint = cast(
+                    "Checkpoint",
+                    self.serde.loads_typed((entry["cp_type"], _unb64(entry["cp_b64"]))),
+                )
+                for channel, version in checkpoint["channel_versions"].items():
+                    field = self._blob_field(checkpoint_ns, channel, str(version))
+                    pipe.eval(_DECREF_LUA, 2, refs_key, blobs_key, field, -1)
+            await pipe.execute()
         return removed
+
+    async def gc_thread(self, thread_id: str, checkpoint_ns: str | None = None) -> int:
+        """mark-sweep 兜底：重建引用计数并删除无任何存活清单引用的孤儿 blob。
+
+        正常路径靠写入/回滚时的引用计数即时回收；本方法用于修正计数漂移
+        或清理引入计数机制之前遗留的孤儿。返回删除的 blob 字段数。
+        """
+        referenced: dict[str, int] = {}
+        for ns in await self._list_namespaces(thread_id, checkpoint_ns):
+            entries = await self._load_entries(thread_id, ns)
+            for entry in entries.values():
+                checkpoint = cast(
+                    "Checkpoint",
+                    self.serde.loads_typed((entry["cp_type"], _unb64(entry["cp_b64"]))),
+                )
+                for channel, version in checkpoint["channel_versions"].items():
+                    field = self._blob_field(ns, channel, str(version))
+                    referenced[field] = referenced.get(field, 0) + 1
+
+        blobs_raw = await self._client.hgetall(self._blobs_key(thread_id))
+        orphans = [
+            self._decode_key(field)
+            for field in blobs_raw
+            if self._decode_key(field) not in referenced
+        ]
+        refs_raw = await self._client.hgetall(self._refs_key(thread_id))
+        stale_counts = [
+            self._decode_key(field)
+            for field in refs_raw
+            if self._decode_key(field) not in referenced
+        ]
+        if orphans:
+            await self._client.hdel(self._blobs_key(thread_id), *orphans)
+        if stale_counts:
+            await self._client.hdel(self._refs_key(thread_id), *stale_counts)
+        if referenced:
+            await self._client.hset(
+                self._refs_key(thread_id),
+                mapping={field: str(count) for field, count in referenced.items()},
+            )
+        return len(orphans)
 
     # ---- 同步接口：异步运行时下显式拒绝（与官方 Async*Saver 行为一致） ----
 
@@ -267,6 +352,9 @@ class RedisSaver(BaseCheckpointSaver[str]):
 
     def _writes_key(self, thread_id: str) -> str:
         return f"{self._prefix}:writes:{thread_id}"
+
+    def _refs_key(self, thread_id: str) -> str:
+        return f"{self._prefix}:refs:{thread_id}"
 
     @staticmethod
     def _entry_field(checkpoint_ns: str, checkpoint_id: str) -> str:

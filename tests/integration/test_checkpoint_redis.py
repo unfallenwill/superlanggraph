@@ -1,9 +1,10 @@
-# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownParameterType=false, reportMissingTypeArgument=false
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownParameterType=false, reportMissingTypeArgument=false, reportPrivateUsage=false
 # langgraph 对未参数化 StateGraph 的泛型推断不完整，测试作为类型边界放宽这几条；
 # src/ 不受影响。
 
 """RedisSaver 集成测试：通过官方编译图机制验证，而非直接打桩。"""
 
+import base64
 import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, TypedDict
@@ -93,3 +94,46 @@ async def test_get_tuple_with_explicit_checkpoint_id(saver: RedisSaver) -> None:
         parent = await saver.aget_tuple(parent_config)
         assert parent is not None
         assert parent.checkpoint["id"] != fetched.checkpoint["id"]
+
+
+async def test_rollback_decrefs_orphan_blobs(saver: RedisSaver) -> None:
+    """回滚删除 checkpoint 后，其独占的 blob 应被引用计数即时回收。"""
+    thread_id = f"t-{uuid.uuid4().hex[:8]}"
+    thread: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    graph = _build_graph(saver)
+    for _ in range(3):
+        await graph.ainvoke({"total": 1}, thread)
+
+    entries = await saver._load_entries(thread_id, "")
+    ids = sorted(entries)
+    assert len(ids) >= 2
+    await saver.adelete_checkpoints_after(thread_id, ids[0])
+
+    survivors = await saver._load_entries(thread_id, "")
+    referenced = {
+        saver._blob_field("", channel, str(version))
+        for entry in survivors.values()
+        for checkpoint in [
+            saver.serde.loads_typed((entry["cp_type"], base64.b64decode(entry["cp_b64"])))
+        ]
+        for channel, version in checkpoint["channel_versions"].items()
+    }
+    blobs = await saver._client.hgetall(saver._blobs_key(thread_id))
+    assert {saver._decode_key(field) for field in blobs} == referenced
+
+    assert await saver.gc_thread(thread_id) == 0  # 引用计数已即时回收，无孤儿
+
+
+async def test_gc_sweeps_injected_orphans(saver: RedisSaver) -> None:
+    """mark-sweep 兜底：手工注入的孤儿 blob 被清扫，计数漂移被重建。"""
+    thread_id = f"t-{uuid.uuid4().hex[:8]}"
+    thread: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    graph = _build_graph(saver)
+    await graph.ainvoke({"total": 1}, thread)
+
+    ghost = saver._blob_field("", "ghost", "v1")
+    await saver._client.hset(saver._blobs_key(thread_id), ghost, '["empty", ""]')
+    assert await saver.gc_thread(thread_id) == 1
+    blobs = await saver._client.hgetall(saver._blobs_key(thread_id))
+    assert saver._decode_key(ghost) not in {saver._decode_key(f) for f in blobs}
+    assert (await graph.aget_state(thread)).values.get("total") == 4  # 存活数据不受影响
