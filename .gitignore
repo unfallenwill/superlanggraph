@@ -14,3 +14,6 @@ wheels/
 
 # Runtime logs
 *.log
+
+# Claude local session files
+.claude/

@@ -3,6 +3,8 @@ name = "superlanggraph"
 version = "0.1.0"
 description = "自托管、生产就绪的 LangGraph 运行时：调度留官方，执行走 Redis"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "croniter>=6.2.4",
