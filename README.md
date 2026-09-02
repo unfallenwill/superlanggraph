@@ -9,8 +9,7 @@
 吞吐不够就加进程。
 
 **验收标准**：官方 `langgraph-sdk` 不改一行代码直连本系统，全部功能可用。对齐的
-可执行定义是 SDK 的 5 个命名空间 46 个方法逐条可用（见 `docs/architecture.md`
-与 `tests/e2e/` 验收套件）。
+可执行定义是 SDK 的 5 个命名空间 46 个方法逐条可用（见 `tests/e2e/` 验收套件）。
 
 ## 前置条件
 
@@ -86,9 +85,6 @@ cli（组合根，唯一绑定具体实现处）
 - **worker** 无状态横向扩，执行真实节点并把 token/custom 事件实时写回事件流；
 - **checkpointer / store / cache** 均为 Redis 实现（`BaseCheckpointSaver` 等官方接口）。
 
-详细设计：`docs/architecture.md`（架构与决策）、`docs/api-contract.md`（HTTP 合同）、
-`docs/engineering.md`（工程规范与魔法条款）。
-
 ## 可观测性（OpenTelemetry）
 
 设置 `OTEL_EXPORTER_OTLP_ENDPOINT` 即启用 traces + metrics 导出（OTLP/HTTP）；
@@ -133,9 +129,6 @@ uv run pytest         # 单元 + 集成（需 docker compose up -d redis）+ e2e
 
 | 路径 | 内容 |
 | --- | --- |
-| `docs/architecture.md` | 架构与决策，含对齐定义（SDK 5 命名空间 46 方法逐条对应） |
-| `docs/api-contract.md` | HTTP 合同：SSE 线上协议 + 全部路由 |
-| `docs/engineering.md` | 工程规范与魔法条款 |
 | `examples/demo/` | 示例图（`agent.py` / `hitl.py` / `slow.py`）、SDK 全流程演示（`client.py`）、压测（`benchmark.py`）、故障恢复演示（`recovery_demo.py`） |
 | `deploy/docker-compose.yml` | 部署编排（单容器 / 多容器两套模式） |
 
