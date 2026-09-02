@@ -16,6 +16,7 @@ dependencies = [
     "opentelemetry-instrumentation-redis>=0.65b0",
     "opentelemetry-sdk>=1.44.0",
     "pydantic-settings>=2.15.0",
+    "python-dotenv>=1.2.3",
     "redis>=8.1.0",
     "uvicorn>=0.52.4",
 ]

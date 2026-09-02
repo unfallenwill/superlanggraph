@@ -115,6 +115,11 @@ docker compose --profile observability up -d otel-collector
 
 敏感信息只放 `.env`，不入库不入 git。
 
+Agent 自己的 env（模型 API key 等）：langgraph.json 支持官方 `env` 字段——
+`"env": ".env"`（相对配置文件目录解析）或内联字典，加载的值注入运行时进程
+环境（覆盖已有变量），节点代码直接 `os.environ` 读取；Docker 部署时 compose
+的 `env_file: .env` 已把变量注入容器。
+
 ## 质量门禁（PR 必须全绿）
 
 ```bash

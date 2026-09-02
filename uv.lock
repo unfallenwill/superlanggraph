@@ -1182,6 +1182,7 @@ dependencies = [
     { name = "opentelemetry-instrumentation-redis" },
     { name = "opentelemetry-sdk" },
     { name = "pydantic-settings" },
+    { name = "python-dotenv" },
     { name = "redis" },
     { name = "uvicorn" },
 ]
@@ -1207,6 +1208,7 @@ requires-dist = [
     { name = "opentelemetry-instrumentation-redis", specifier = ">=0.65b0" },
     { name = "opentelemetry-sdk", specifier = ">=1.44.0" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
+    { name = "python-dotenv", specifier = ">=1.2.3" },
     { name = "redis", specifier = ">=8.1.0" },
     { name = "uvicorn", specifier = ">=0.52.4" },
 ]

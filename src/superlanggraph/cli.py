@@ -18,14 +18,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 import uvicorn
+from dotenv import dotenv_values
 
 from superlanggraph.broker.redis import RedisBroker
 from superlanggraph.broker.runs import RunStore
@@ -68,6 +70,36 @@ def _install_dependencies(config_path: Path) -> None:
             print(f"  警告: {dep} 安装失败: {result.stderr[:200]}", file=sys.stderr)
 
 
+def load_config_env(config_path: Path) -> None:
+    """对齐官方 langgraph.json 的 ``env`` 字段，把变量注入当前进程环境。
+
+    与官方 dev 行为一致：字符串形态是 .env 文件路径（相对 langgraph.json 所在
+    目录解析），字典形态是内联键值映射；加载的值覆盖已有环境变量。因此必须在
+    构造 settings、导入用户图之前调用。字段缺省时不做任何事（不自动读 .env）。
+    """
+    if not config_path.exists():
+        return
+    env_field = json.loads(config_path.read_text(encoding="utf-8")).get("env")
+    if env_field is None:
+        return
+
+    if isinstance(env_field, str):
+        env_path = (config_path.parent / env_field).resolve()
+        if not env_path.exists():
+            print(f"  警告: langgraph.json 声明的 env 文件不存在: {env_path}", file=sys.stderr)
+            return
+        values = {k: v for k, v in dotenv_values(env_path).items() if v is not None}
+    elif isinstance(env_field, dict):
+        mapping = cast("dict[str, Any]", env_field)
+        values = {str(k): str(v) for k, v in mapping.items()}
+    else:
+        msg = f"langgraph.json 的 env 字段仅支持文件路径或键值映射，收到: {env_field!r}"
+        raise ValueError(msg)
+
+    for key, value in values.items():
+        os.environ[key] = value
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """解析角色参数并启动对应服务。"""
     parser = argparse.ArgumentParser(prog="superlanggraph", description="自托管 LangGraph 运行时")
@@ -101,6 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "server":
         config_path = Path(args.config)
         _install_dependencies(config_path)
+        load_config_env(config_path)
         settings = BrokerSettings()
         roles = {part.strip() for part in args.roles.split(",") if part.strip()}
         app = build_app(settings, config_path, background_roles=roles)
@@ -111,6 +144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command in ("driver", "worker", "cron"):
         config_path = Path(args.config)
         _install_dependencies(config_path)
+        load_config_env(config_path)
         settings = BrokerSettings()
         asyncio.run(serve_background_role(settings, config_path, args.command))
         return 0
