@@ -9,23 +9,22 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
-Model = type[BaseModel]
-
-
-def _json_schema(model: Model | list[Model]) -> dict[str, Any]:
-    if isinstance(model, list):
-        return {"type": "array", "items": model[0].model_json_schema()}
-    return model.model_json_schema()
+Model = type[Any]
 
 
-def request_body(model: Model | list[Model]) -> dict[str, Any]:
+def _json_schema(model: type[Any]) -> dict[str, Any]:
+    """统一转 schema：模型类 / list[模型] / dict[str, 模型] 都支持。"""
+    return TypeAdapter(model).json_schema()
+
+
+def request_body(model: type[Any]) -> dict[str, Any]:
     """把请求模型转成 OpenAPI 的 requestBody 声明。"""
     return {"required": False, "content": {"application/json": {"schema": _json_schema(model)}}}
 
 
-def response_schema(model: Model | list[Model]) -> dict[str, Any]:
+def response_schema(model: type[Any]) -> dict[str, Any]:
     """把响应模型转成 OpenAPI 的 200 响应声明。"""
     return {
         "description": "Successful Response",
@@ -246,7 +245,7 @@ class CronCountRequest(BaseModel):
 
 
 # 路径 -> 请求模型。键形如 "method path"；list 表示数组 body（/runs/batch）。
-ROUTE_REQUEST_SCHEMAS: dict[str, Model | list[Model]] = {
+ROUTE_REQUEST_SCHEMAS: dict[str, type[Any]] = {
     "post /assistants": AssistantCreateRequest,
     "patch /assistants/{assistant_id}": AssistantUpdateRequest,
     "post /assistants/search": AssistantSearchRequest,
@@ -267,7 +266,7 @@ ROUTE_REQUEST_SCHEMAS: dict[str, Model | list[Model]] = {
     "post /threads/{thread_id}/runs/wait": RunCreateRequest,
     "post /runs/stream": RunCreateRequest,
     "post /runs/wait": RunCreateRequest,
-    "post /runs/batch": [RunBatchItemRequest],
+    "post /runs/batch": list[RunBatchItemRequest],
     "post /runs/cancel": RunCancelRequest,
     "post /threads/{thread_id}/runs/{run_id}/stream": JoinStreamRequest,
     "put /store/items": StorePutRequest,
@@ -280,6 +279,30 @@ ROUTE_REQUEST_SCHEMAS: dict[str, Model | list[Model]] = {
     "post /runs/crons/search": CronSearchRequest,
     "post /runs/crons/count": CronCountRequest,
 }
+
+
+class GraphResponse(BaseModel):
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+
+
+class AssistantSchemas(BaseModel):
+    graph_id: str
+    input_schema: dict[str, Any] | None = None
+    output_schema: dict[str, Any] | None = None
+    state_schema: dict[str, Any] | None = None
+    config_schema: dict[str, Any] | None = None
+    context_schema: dict[str, Any] | None = None
+
+
+class SubgraphInfo(BaseModel):
+    graph_id: str
+    input_schema: dict[str, Any] | None = None
+    output_schema: dict[str, Any] | None = None
+
+
+class HealthResponse(BaseModel):
+    status: str
 
 
 # ---- 响应模型 ----
@@ -385,30 +408,37 @@ class Cron(BaseModel):
 
 # "方法 路径" -> 200 响应模型。SSE（stream）与自由形状（wait/join 返回线程
 # values）无法用固定模型描述，保持 FastAPI 推断的泛型声明。
-ROUTE_RESPONSE_SCHEMAS: dict[str, Model | list[Model]] = {
+ROUTE_RESPONSE_SCHEMAS: dict[str, Any] = {
+    "get /health": HealthResponse,
     "post /assistants": Assistant,
     "patch /assistants/{assistant_id}": Assistant,
-    "post /assistants/search": [Assistant],
+    "post /assistants/search": list[Assistant],
     "post /assistants/{assistant_id}/latest": Assistant,
-    "post /assistants/{assistant_id}/versions": [AssistantVersion],
+    "post /assistants/{assistant_id}/versions": list[AssistantVersion],
     "get /assistants/{assistant_id}": Assistant,
+    "get /assistants/{assistant_id}/graph": GraphResponse,
+    "get /assistants/{assistant_id}/schemas": AssistantSchemas,
+    "get /assistants/{assistant_id}/subgraphs": dict[str, SubgraphInfo],
+    "get /assistants/{assistant_id}/subgraphs/{namespace}": dict[str, SubgraphInfo],
     "get /threads/{thread_id}": Thread,
     "post /threads": Thread,
     "patch /threads/{thread_id}": Thread,
-    "post /threads/search": [Thread],
+    "post /threads/search": list[Thread],
     "get /threads/{thread_id}/state": ThreadState,
     "get /threads/{thread_id}/state/{checkpoint_id}": ThreadState,
     "post /threads/{thread_id}/state/checkpoint": ThreadState,
     "post /threads/{thread_id}/state": ThreadStateUpdateResponse,
-    "post /threads/{thread_id}/history": [ThreadState],
+    "post /threads/{thread_id}/history": list[ThreadState],
+    "get /threads/{thread_id}/runs": list[Run],
+    "get /threads/{thread_id}/runs/{run_id}": Run,
     "post /threads/{thread_id}/runs": Run,
     "post /threads/{thread_id}/runs/{run_id}/cancel": Run,
-    "post /runs/batch": [Run],
-    "post /runs/cancel": [Run],
+    "post /runs/batch": list[Run],
+    "post /runs/cancel": list[Run],
     "get /store/items": StoreItem,
     "post /store/items/search": StoreSearchResponse,
     "post /runs/crons": Cron,
     "post /threads/{thread_id}/runs/crons": Cron,
     "patch /runs/crons/{cron_id}": Cron,
-    "post /runs/crons/search": [Cron],
+    "post /runs/crons/search": list[Cron],
 }
