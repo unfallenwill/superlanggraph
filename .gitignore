@@ -17,3 +17,6 @@ wheels/
 
 # Claude local session files
 .claude/
+
+# 本地设计文档，不入库
+docs/
