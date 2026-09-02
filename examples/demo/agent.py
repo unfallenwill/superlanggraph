@@ -1,4 +1,5 @@
 """演示 agent：generate 发 custom 流式事件，amplify 放大结果。"""
+
 from typing import TypedDict
 
 from langgraph.config import get_stream_writer

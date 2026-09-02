@@ -1,4 +1,5 @@
 """慢节点图：供守尸接管演示。"""
+
 import time
 from typing import TypedDict
 

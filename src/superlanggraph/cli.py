@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -40,6 +41,31 @@ from superlanggraph.store.redis_store import RedisStore
 from superlanggraph.worker.executor import NodeWorker
 
 _ROLES = ("server", "driver", "worker", "cron", "up")
+
+
+def _install_dependencies(config_path: Path) -> None:
+    """读取 langgraph.json 的 dependencies 数组，安装第三方依赖到当前环境。
+
+    对齐官方 langgraph.json 的 dependencies 字段语义。
+    优先用 uv pip install（项目实际使用 uv 管理依赖），pip 兜底。
+    """
+    if not config_path.exists():
+        return
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    deps = config.get("dependencies", [])
+    if not deps:
+        return
+
+    for dep in deps:
+        print(f"  安装依赖: {dep}", flush=True)
+        result = subprocess.run(
+            ["uv", "pip", "install", dep],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            print(f"  警告: {dep} 安装失败: {result.stderr[:200]}", file=sys.stderr)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -73,16 +99,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "server":
+        config_path = Path(args.config)
+        _install_dependencies(config_path)
         settings = BrokerSettings()
         roles = {part.strip() for part in args.roles.split(",") if part.strip()}
-        app = build_app(settings, Path(args.config), background_roles=roles)
+        app = build_app(settings, config_path, background_roles=roles)
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
     if args.command == "up":
         return _run_up(args)
     if args.command in ("driver", "worker", "cron"):
+        config_path = Path(args.config)
+        _install_dependencies(config_path)
         settings = BrokerSettings()
-        asyncio.run(serve_background_role(settings, Path(args.config), args.command))
+        asyncio.run(serve_background_role(settings, config_path, args.command))
         return 0
     parser.print_help()
     return 1
@@ -115,7 +145,7 @@ def _run_up(args: argparse.Namespace) -> int:
         cmd.append("-d")
 
     print(f"superlanggraph up（config: {config_path}）", flush=True)
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, check=False)
     return result.returncode
 
 

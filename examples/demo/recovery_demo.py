@@ -5,7 +5,6 @@ import os
 import signal
 import subprocess
 import time
-import uuid
 
 from langgraph_sdk import get_client
 
@@ -16,7 +15,7 @@ API_KEY = "demo-key"
 def kill_drivers() -> list[int]:
     """杀掉全部 driver 进程，返回被杀的 pid。"""
     out = subprocess.run(
-        ["pgrep", "-af", "superlanggraph driver"], capture_output=True, text=True
+        ["pgrep", "-af", "superlanggraph driver"], capture_output=True, text=True, check=False
     ).stdout
     killed = []
     for line in out.splitlines():
@@ -49,8 +48,7 @@ async def main() -> None:
 
     print("4) 启动新的 driver 进程（守尸开始扫描）", flush=True)
     proc = subprocess.Popen(
-        ["uv", "run", "superlanggraph", "driver", "--config",
-         "examples/demo/langgraph.json"],
+        ["uv", "run", "superlanggraph", "driver", "--config", "examples/demo/langgraph.json"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
