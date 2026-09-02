@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from superlanggraph.core.envelope import Envelope
 from superlanggraph.core.serde import dumps_json_text
+from superlanggraph.server.body import json_body
 from superlanggraph.server.runtime import RunRejectedError, ServerRuntime
 from superlanggraph.server.sse import tail_events
 
@@ -149,14 +150,14 @@ def _extra_config(payload: dict[str, Any]) -> dict[str, Any]:
 @router.post("/threads/{thread_id}/runs/stream")
 async def stream_thread_run(thread_id: str, request: Request) -> StreamingResponse:
     """创建 run 并以 SSE 返回其事件流。"""
-    payload = await request.json()
+    payload = await json_body(request)
     return await _start_stream_run(request, thread_id, payload)
 
 
 @router.post("/runs/stream")
 async def stream_run(request: Request) -> StreamingResponse:
     """threadless 版本的流式 run。"""
-    payload = await request.json()
+    payload = await json_body(request)
     return await _start_stream_run(request, None, payload)
 
 
@@ -164,7 +165,7 @@ async def stream_run(request: Request) -> StreamingResponse:
 async def create_thread_run(thread_id: str, request: Request) -> dict[str, Any]:
     """创建后台 run，立即返回 run 记录。"""
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     await runtime.ensure_thread(thread_id)
     try:
         record = await runtime.create_run(
@@ -187,7 +188,7 @@ async def create_thread_run(thread_id: str, request: Request) -> dict[str, Any]:
 async def create_run_batch(request: Request) -> list[dict[str, Any]]:
     """批量创建后台 run。"""
     runtime = _runtime(request)
-    payloads = await request.json()
+    payloads = await json_body(request)
     records: list[dict[str, Any]] = []
     for payload in payloads:
         thread_id = str(payload["thread_id"])
@@ -208,7 +209,7 @@ async def create_run_batch(request: Request) -> list[dict[str, Any]]:
 async def wait_thread_run(thread_id: str, request: Request) -> Any:
     """创建 run 并阻塞到终态，返回线程最终 state values。"""
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     await runtime.ensure_thread(thread_id)
     try:
         record = await runtime.create_run(
@@ -234,7 +235,7 @@ async def wait_thread_run(thread_id: str, request: Request) -> Any:
 @router.post("/runs/wait")
 async def wait_run(request: Request) -> Any:
     """threadless 版本的同步 run。"""
-    payload = await request.json()
+    payload = await json_body(request)
     thread_id = _ephemeral_thread_id()
     runtime = _runtime(request)
     await runtime.ensure_thread(thread_id)
@@ -314,7 +315,7 @@ async def cancel_run(
 async def cancel_many_runs(request: Request) -> list[dict[str, Any]]:
     """按条件批量取消（thread_id / run_ids / status 的交集）。"""
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     thread_id = payload.get("thread_id")
     run_ids = cast("list[Any]", payload.get("run_ids") or [])
     status = payload.get("status")
@@ -360,7 +361,7 @@ async def join_run(thread_id: str, run_id: str, request: Request) -> Any:
 async def join_stream(thread_id: str, run_id: str, request: Request) -> StreamingResponse:
     """加入一个已存在 run 的事件流（可断点续读）。"""
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     record = await runtime.runs.get(run_id)
     if record is None:
         raise HTTPException(404, f"run 不存在: {run_id}")

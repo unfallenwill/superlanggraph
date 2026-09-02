@@ -11,6 +11,7 @@ from typing import Any, cast
 from fastapi import APIRouter, HTTPException, Request
 
 from superlanggraph.cron.scheduler import CronRecord, new_cron_id, next_after, utc_now
+from superlanggraph.server.body import json_body
 from superlanggraph.server.runtime import ServerRuntime
 
 router = APIRouter()
@@ -34,7 +35,7 @@ def _now() -> str:
 @router.post("/assistants")
 async def create_assistant(request: Request) -> dict[str, Any]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     graph_id = str(payload.get("graph_id") or "")
     if not runtime.registry.has(graph_id):
         raise HTTPException(404, f"图不存在: {graph_id}")
@@ -91,7 +92,7 @@ async def update_assistant(assistant_id: str, request: Request) -> dict[str, Any
     record = await _find_assistant(runtime, assistant_id)
     if record is None:
         raise HTTPException(404, f"assistant 不存在: {assistant_id}")
-    payload = await request.json()
+    payload = await json_body(request)
     version = int(record.get("version") or 1) + 1
     updated = dict(record)
     updated["version"] = str(version)
@@ -123,7 +124,7 @@ async def delete_assistant(assistant_id: str, request: Request) -> None:
 @router.post("/assistants/search")
 async def search_assistants(request: Request) -> list[dict[str, Any]]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     limit = int(payload.get("limit", 10))
     offset = int(payload.get("offset", 0))
     found = await _collect_assistants(runtime, payload)
@@ -165,7 +166,7 @@ async def _collect_assistants(
 @router.post("/assistants/count")
 async def count_assistants(request: Request) -> int:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     return len(await _collect_assistants(runtime, payload))
 
 
@@ -176,7 +177,7 @@ async def get_assistant_versions(assistant_id: str, request: Request) -> list[di
     if record is None:
         raise HTTPException(404, f"assistant 不存在: {assistant_id}")
     latest = int(record.get("version") or 1)
-    limit = int((await request.json()).get("limit", 10))
+    limit = int((await json_body(request)).get("limit", 10))
     versions: list[dict[str, Any]] = []
     for version in range(latest, max(latest - limit, 0), -1):
         history = dict(record)
@@ -194,7 +195,7 @@ async def get_assistant_versions(assistant_id: str, request: Request) -> list[di
 @router.post("/assistants/{assistant_id}/latest")
 async def set_latest_version(assistant_id: str, request: Request) -> dict[str, Any]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     record = await _find_assistant(runtime, assistant_id)
     if record is None:
         raise HTTPException(404, f"assistant 不存在: {assistant_id}")
@@ -281,7 +282,7 @@ async def get_assistant_subgraph(
 @router.put("/store/items")
 async def put_store_item(request: Request) -> None:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     await runtime.kv.aput(
         tuple(payload["namespace"]),
         str(payload["key"]),
@@ -310,7 +311,7 @@ async def get_store_item(request: Request) -> dict[str, Any]:
 @router.delete("/store/items")
 async def delete_store_item(request: Request) -> None:
     runtime = _runtime(request)
-    payload = cast("dict[str, Any]", await request.json())
+    payload = cast("dict[str, Any]", await json_body(request))
     namespace = cast("list[str]", payload.get("namespace") or [])
     key = str(payload.get("key") or "")
     await runtime.kv.adelete(tuple(namespace), key)
@@ -319,7 +320,7 @@ async def delete_store_item(request: Request) -> None:
 @router.post("/store/items/search")
 async def search_store_items(request: Request) -> dict[str, Any]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     items = await runtime.kv.asearch(
         tuple(payload.get("namespace_prefix") or []),
         filter=payload.get("filter"),
@@ -344,7 +345,7 @@ async def search_store_items(request: Request) -> dict[str, Any]:
 @router.post("/store/namespaces")
 async def list_store_namespaces(request: Request) -> list[list[str]]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     namespaces = await runtime.kv.alist_namespaces(
         prefix=payload.get("prefix"),
         suffix=payload.get("suffix"),
@@ -365,7 +366,7 @@ def _parse_namespace(text: str) -> tuple[str, ...]:
 @router.post("/runs/crons")
 async def create_cron(request: Request) -> dict[str, Any]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     assistant_id = str(payload["assistant_id"])
     assistant = await _find_assistant(runtime, assistant_id)
     if assistant is None:
@@ -387,7 +388,7 @@ async def create_cron(request: Request) -> dict[str, Any]:
 
 @router.post("/threads/{thread_id}/runs/crons")
 async def create_thread_cron(thread_id: str, request: Request) -> dict[str, Any]:
-    payload = await request.json()
+    payload = await json_body(request)
     payload["thread_id"] = thread_id
     runtime = _runtime(request)
     assistant_id = str(payload["assistant_id"])
@@ -419,7 +420,7 @@ async def delete_cron(cron_id: str, request: Request) -> None:
 @router.patch("/runs/crons/{cron_id}")
 async def update_cron(cron_id: str, request: Request) -> dict[str, Any]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     fields: dict[str, Any] = {}
     if payload.get("schedule"):
         fields["schedule"] = str(payload["schedule"])
@@ -439,7 +440,7 @@ async def update_cron(cron_id: str, request: Request) -> dict[str, Any]:
 @router.post("/runs/crons/search")
 async def search_crons(request: Request) -> list[dict[str, Any]]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     records = await runtime.crons.all()
     wanted = payload.get("assistant_id")
     thread_id = payload.get("thread_id")
@@ -457,7 +458,7 @@ async def search_crons(request: Request) -> list[dict[str, Any]]:
 @router.post("/runs/crons/count")
 async def count_crons(request: Request) -> int:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     records = await runtime.crons.all()
     wanted = payload.get("assistant_id")
     if wanted is None:

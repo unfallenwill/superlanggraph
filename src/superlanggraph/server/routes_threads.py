@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from superlanggraph.core.serde import dumps_json_text
+from superlanggraph.server.body import json_body
 from superlanggraph.server.runtime import ServerRuntime
 from superlanggraph.server.sse import sse_frame
 
@@ -102,7 +103,7 @@ def _thread_config(
 @router.post("/threads")
 async def create_thread(request: Request) -> dict[str, Any]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     thread_id = str(payload.get("thread_id") or uuid.uuid4().hex)
     if payload.get("if_exists") == "raise" and await runtime.redis.exists(_thread_key(thread_id)):
         raise HTTPException(409, f"thread 已存在: {thread_id}")
@@ -205,7 +206,7 @@ async def _graph_id_for_thread(runtime: ServerRuntime, thread_id: str) -> str:
 @router.patch("/threads/{thread_id}")
 async def update_thread(thread_id: str, request: Request) -> dict[str, Any]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     record = await _get_thread_record(runtime, thread_id)
     if payload.get("metadata") is not None:
         record["metadata"] = json.dumps(payload["metadata"])
@@ -230,7 +231,7 @@ async def delete_thread(thread_id: str, request: Request) -> None:
 @router.post("/threads/search")
 async def search_threads(request: Request) -> list[dict[str, Any]]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     limit = int(payload.get("limit", 10))
     offset = int(payload.get("offset", 0))
     wanted_metadata = cast("dict[str, Any]", payload.get("metadata") or {})
@@ -262,7 +263,7 @@ async def search_threads(request: Request) -> list[dict[str, Any]]:
 @router.post("/threads/count")
 async def count_threads(request: Request) -> int:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     found = await search_threads_for_count(runtime, payload)
     return found
 
@@ -308,7 +309,7 @@ async def copy_thread(thread_id: str, request: Request) -> None:
 async def prune_threads(request: Request) -> list[str]:
     """按策略清理线程；v1 支持 delete（全删）与 keep_latest（仅删记录）。"""
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     strategy = str(payload.get("strategy", "delete"))
     pruned: list[str] = []
     for thread_id in payload.get("thread_ids", []):
@@ -358,7 +359,7 @@ async def get_thread_state_at(
 @router.post("/threads/{thread_id}/state/checkpoint")
 async def get_thread_state_by_checkpoint(thread_id: str, request: Request) -> dict[str, Any]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     await _get_thread_record(runtime, thread_id)
     graph_id = await _graph_id_for_thread(runtime, thread_id)
     graph = runtime.registry.compile_local(graph_id, checkpointer=runtime.saver)
@@ -371,7 +372,7 @@ async def get_thread_state_by_checkpoint(thread_id: str, request: Request) -> di
 @router.post("/threads/{thread_id}/state")
 async def update_thread_state(thread_id: str, request: Request) -> dict[str, Any]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     await _get_thread_record(runtime, thread_id)
     graph_id = await _graph_id_for_thread(runtime, thread_id)
     graph = runtime.registry.compile_local(graph_id, checkpointer=runtime.saver)
@@ -395,7 +396,7 @@ async def update_thread_state(thread_id: str, request: Request) -> dict[str, Any
 @router.post("/threads/{thread_id}/history")
 async def get_thread_history(thread_id: str, request: Request) -> list[dict[str, Any]]:
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     await _get_thread_record(runtime, thread_id)
     graph_id = await _graph_id_for_thread(runtime, thread_id)
     graph = runtime.registry.compile_local(graph_id, checkpointer=runtime.saver)
@@ -426,7 +427,7 @@ async def get_thread_history(thread_id: str, request: Request) -> list[dict[str,
 async def stream_thread(thread_id: str, request: Request) -> StreamingResponse:
     """订阅线程级事件（lifecycle / state_update / run_modes）。"""
     runtime = _runtime(request)
-    payload = await request.json()
+    payload = await json_body(request)
     modes = payload.get("stream_mode") or ["lifecycle"]
     requested = {modes} if isinstance(modes, str) else set(modes)
     await _get_thread_record(runtime, thread_id)
