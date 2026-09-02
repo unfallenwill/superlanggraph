@@ -10,11 +10,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 
 from langgraph_sdk import get_client
 
-URL = "http://127.0.0.1:8000"
+URL = os.getenv("SLG_EXAMPLE_URL", "http://127.0.0.1:8000")
 API_KEY = "demo-key"
 GRAPH = "agent"
 CONCURRENCY_LEVELS = (10, 50, 100)
