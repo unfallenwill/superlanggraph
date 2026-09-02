@@ -7,6 +7,7 @@ create_app 只接收装配完成的 ServerRuntime（由组合根构造），挂�
 from __future__ import annotations
 
 from types import TracebackType
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -16,6 +17,12 @@ from superlanggraph.server.routes_misc import router as misc_router
 from superlanggraph.server.routes_runs import router as runs_router
 from superlanggraph.server.routes_threads import router as threads_router
 from superlanggraph.server.runtime import ServerRuntime
+from superlanggraph.server.schemas import (
+    ROUTE_REQUEST_SCHEMAS,
+    ROUTE_RESPONSE_SCHEMAS,
+    request_body,
+    response_schema,
+)
 
 
 async def health() -> dict[str, str]:
@@ -67,6 +74,29 @@ class RuntimeLifespan:
         return self
 
 
+def _operation_for(spec: dict[str, Any], key: str) -> dict[str, Any] | None:
+    method, _, path = key.partition(" ")
+    return spec.get("paths", {}).get(path, {}).get(method)
+
+
+def _attach_openapi_schemas(app: FastAPI) -> None:
+    """把 schemas.py 的请求/响应模型注入 OpenAPI（Swagger 展示与 Try-it-out）。
+
+    路由用裸 Request 手工解析 body（容错空 body），FastAPI 无法自行推断；
+    模型对照 langgraph-sdk 0.4.4 的 payload 合同，注入时已有的响应声明保留。
+    """
+    spec = app.openapi()
+    for key, model in ROUTE_REQUEST_SCHEMAS.items():
+        operation = _operation_for(spec, key)
+        if operation is not None:
+            operation["requestBody"] = request_body(model)
+    for key, model in ROUTE_RESPONSE_SCHEMAS.items():
+        operation = _operation_for(spec, key)
+        if operation is not None:
+            responses = operation.setdefault("responses", {})
+            responses["200"] = response_schema(model)
+
+
 def create_app(
     runtime: ServerRuntime,
     *,
@@ -92,5 +122,6 @@ def create_app(
     app.include_router(runs_router, dependencies=dependencies)
     app.include_router(threads_router, dependencies=dependencies)
     app.include_router(misc_router, dependencies=dependencies)
+    _attach_openapi_schemas(app)
     FastAPIInstrumentor.instrument_app(app)
     return app
