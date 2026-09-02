@@ -388,10 +388,16 @@ class RedisSaver(BaseCheckpointSaver[str]):
     async def _load_blobs(
         self, thread_id: str, checkpoint_ns: str, versions: ChannelVersions
     ) -> builtins.dict[str, Any]:
+        channels = list(versions)
+        fields = [
+            self._blob_field(checkpoint_ns, channel, str(version))
+            for channel, version in versions.items()
+        ]
+        # CoW 存储：checkpoint 只引用 (channel, version)，未变化的 channel 天然
+        # 复用既有 blob。读路径一次 HMGET 批量取齐，避免逐 channel 往返。
+        raws = await self._client.hmget(self._blobs_key(thread_id), fields)
         result: dict[str, Any] = {}
-        for channel, version in versions.items():
-            field = self._blob_field(checkpoint_ns, channel, str(version))
-            raw = await self._client.hget(self._blobs_key(thread_id), field)
+        for channel, raw in zip(channels, raws, strict=True):
             if raw is None:
                 continue
             parsed = cast("list[Any]", json.loads(raw))
