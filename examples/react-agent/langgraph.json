@@ -1,0 +1,7 @@
+{
+  "graphs": {
+    "agent": "./agent.py:graph"
+  },
+  "dependencies": ["langchain-anthropic>=1.7.0"],
+  "env": ".env"
+}

@@ -135,6 +135,7 @@ uv run pytest         # 单元 + 集成（需 docker compose up -d redis）+ e2e
 | 路径 | 内容 |
 | --- | --- |
 | `examples/demo/` | 示例图（`agent.py` / `hitl.py` / `slow.py`）、SDK 全流程演示（`client.py`）、压测（`benchmark.py`）、故障恢复演示（`recovery_demo.py`） |
+| `examples/react-agent/` | 原生 LLM 工具调用 react-agent：`dependencies` 自动装依赖、`env` 字段注入模型 key、messages 流式、跨轮记忆 |
 | `deploy/docker-compose.yml` | 部署编排（单容器 / 多容器两套模式） |
 
 ## License
