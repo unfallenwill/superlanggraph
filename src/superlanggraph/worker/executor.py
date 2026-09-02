@@ -25,6 +25,8 @@ from langgraph._internal._constants import (
 )
 from langgraph._internal._scratchpad import PregelScratchpad
 from langgraph.errors import GraphInterrupt
+from langgraph.pregel._messages import StreamMessagesHandler
+from langgraph.pregel.protocol import StreamChunk
 from langgraph.runtime import Runtime
 from xxhash import xxh3_128_hexdigest
 
@@ -257,6 +259,7 @@ class NodeWorker:
             "run_name": task.node,
             "metadata": dict(task.metadata),
             "tags": list(task.tags),
+            "callbacks": [_messages_relay(task, self._outbox)],
             "configurable": {
                 "thread_id": task.thread_id,
                 "checkpoint_ns": task.checkpoint_ns,
@@ -309,6 +312,29 @@ def _custom_sink(task: NodeTask, outbox: asyncio.Queue[Envelope]):
             )
 
     return writer
+
+
+def _messages_relay(task: NodeTask, outbox: asyncio.Queue[Envelope]) -> StreamMessagesHandler:
+    """messages 模式的 token 回传：把官方 handler 的三元组还原成事件信封。
+
+    真实 LLM 调用发生在 worker，driver 侧挂的 StreamMessagesHandler 看不到
+    token；callbacks 无法跨 Redis 信封序列化，只能在这里按官方同款契约重建。
+    handler 回调收到 (ns, "messages", (message, metadata))，data 只取 payload，
+    与 driver 直发形状一致。
+    """
+
+    def relay(item: StreamChunk) -> None:
+        _, _, payload = item
+        outbox.put_nowait(
+            Envelope(
+                type="event",
+                run_id=task.run_id,
+                task_id=task.task_id,
+                payload={"event": "messages", "data": dumps_json_text(payload)},
+            )
+        )
+
+    return StreamMessagesHandler(relay, False)
 
 
 def _message_sink(task: NodeTask, outbox: asyncio.Queue[Envelope]):
