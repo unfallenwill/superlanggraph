@@ -25,6 +25,8 @@ from superlanggraph.core.errors import SlgError
 from superlanggraph.core.protocols import ControlBus, EventBus, ResultBus, TaskQueue
 from superlanggraph.cron.scheduler import CronTable, next_after, utc_now
 from superlanggraph.driver.runner import ControlDispatcher, RunExecutor
+from superlanggraph.monitoring.collector import MonitoringCollector
+from superlanggraph.monitoring.store import MetricStore
 from superlanggraph.observability import inject_into_envelope, setup_otel, shutdown_otel
 from superlanggraph.observability.metrics import make_metrics_collector
 from superlanggraph.registry.loader import Registry
@@ -53,15 +55,21 @@ class ServerRuntime:
     executor: RunExecutor
     dispatcher: ControlDispatcher
     worker: NodeWorker
+    # 监控接线：默认全 None/空（监控关闭），既有构造方零变化。
+    monitor_store: MetricStore | None = None
+    monitor_collectors: list[MonitoringCollector] = field(
+        default_factory=list[MonitoringCollector]
+    )
+    monitor_probe_interval_seconds: float = 10.0
     _background: list[asyncio.Task[None]] = field(default_factory=list[asyncio.Task[None]])
 
     async def start_background(self, roles: set[str] | None = None) -> None:
         """按角色启动进程内后台循环；roles 为空表示单机全角色模式。
 
-        角色映射：driver→控制分发、worker→节点执行、cron→定时调度；
-        server 角色本身没有后台循环（纯 HTTP 接入）。
+        角色映射：driver→控制分发、worker→节点执行、cron→定时调度、
+        monitor→监控探针轮询；server 角色本身没有后台循环（纯 HTTP 接入）。
         """
-        enabled = roles if roles else {"server", "driver", "worker", "cron", "metrics"}
+        enabled = roles if roles else {"server", "driver", "worker", "cron", "metrics", "monitor"}
         if "driver" in enabled:
             self._background.append(
                 asyncio.create_task(self.dispatcher.serve_forever(), name="slg-dispatcher")
@@ -74,6 +82,25 @@ class ServerRuntime:
             self._background.append(asyncio.create_task(self._cron_loop(), name="slg-cron"))
         if "metrics" in enabled:
             self._background.append(asyncio.create_task(self._metrics_loop(), name="slg-metrics"))
+        if "monitor" in enabled and self.monitor_store is not None:
+            self._background.append(asyncio.create_task(self._monitor_loop(), name="slg-monitor"))
+        # 采集器排水任务须在事件循环内启动（幂等）；列表为空即零开销。
+        for collector in self.monitor_collectors:
+            collector.start()
+
+    async def _monitor_loop(self) -> None:
+        """监控探针循环：周期轮询队列深度 / PEL / 活跃 run / worker 存活写入存储。"""
+        store = self.monitor_store
+        if store is None:
+            return
+        while True:
+            try:
+                await store.record_probe(await store.poll_probe())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(self.monitor_probe_interval_seconds)
 
     async def _metrics_loop(self) -> None:
         """周期采集运维指标（队列/PEL/活跃 run），经 OTel 导出。"""
@@ -122,6 +149,11 @@ class ServerRuntime:
         for task in self._background:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        # 监控收尾：排空采集队列剩余事件、释放 store 持有资源（未接线时为零开销）。
+        for collector in self.monitor_collectors:
+            await collector.aclose()
+        if self.monitor_store is not None:
+            await self.monitor_store.aclose()
 
     async def _has_active_runs(self) -> bool:
         async for _thread_id, _run_id in self.runs.list_active_runs():

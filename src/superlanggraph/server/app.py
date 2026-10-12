@@ -6,13 +6,17 @@ create_app 只接收装配完成的 ServerRuntime（由组合根构造），挂�
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 from superlanggraph.core.settings import AuthSettings
+from superlanggraph.monitoring.routes import router as monitor_router
+from superlanggraph.monitoring.store import MetricStore
 from superlanggraph.server.routes_misc import router as misc_router
 from superlanggraph.server.routes_runs import router as runs_router
 from superlanggraph.server.routes_threads import router as threads_router
@@ -23,6 +27,8 @@ from superlanggraph.server.schemas import (
     request_body,
     response_schema,
 )
+
+_MONITOR_STATIC_DIR = Path(__file__).resolve().parents[1] / "monitoring" / "static"
 
 
 async def health() -> dict[str, str]:
@@ -103,11 +109,13 @@ def create_app(
     run_background: bool = True,
     background_roles: set[str] | None = None,
     auth: AuthSettings | None = None,
+    monitor_store: MetricStore | None = None,
 ) -> FastAPI:
     """创建应用实例；依赖注入在组合根完成，路由层不自取全局状态。
 
     ``background_roles``：本进程内嵌的后台循环集合（driver/worker/cron）；
-    None 表示单机全角色模式。
+    None 表示单机全角色模式。``monitor_store``：监控聚合存储；None 表示监控
+    关闭，不挂监控路由与静态页（行为与未集成前完全一致）。
     """
     auth_settings = auth or AuthSettings()
     guard = _make_api_key_guard(auth_settings)
@@ -122,6 +130,15 @@ def create_app(
     app.include_router(runs_router, dependencies=dependencies)
     app.include_router(threads_router, dependencies=dependencies)
     app.include_router(misc_router, dependencies=dependencies)
+    if monitor_store is not None:
+        app.state.monitor = monitor_store
+        app.include_router(monitor_router, dependencies=dependencies)
+        if _MONITOR_STATIC_DIR.joinpath("index.html").is_file():
+            app.mount(
+                "/monitor/ui",
+                StaticFiles(directory=_MONITOR_STATIC_DIR, html=True),
+                name="monitor-ui",
+            )
     _attach_openapi_schemas(app)
     FastAPIInstrumentor.instrument_app(app)
     return app

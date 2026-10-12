@@ -32,9 +32,10 @@ from dotenv import dotenv_values
 from superlanggraph.broker.redis import RedisBroker
 from superlanggraph.broker.runs import RunStore
 from superlanggraph.checkpoint.redis_saver import RedisSaver
-from superlanggraph.core.settings import AuthSettings, BrokerSettings
+from superlanggraph.core.settings import AuthSettings, BrokerSettings, MonitoringSettings
 from superlanggraph.cron.scheduler import CronTable
 from superlanggraph.driver.runner import ControlDispatcher, RunExecutor
+from superlanggraph.monitoring import MonitoringCollector, RedisMetricStore
 from superlanggraph.observability import setup_otel
 from superlanggraph.registry.loader import Registry
 from superlanggraph.server.app import create_app
@@ -111,7 +112,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     server_parser.add_argument("--config", default="langgraph.json", help="langgraph.json 路径")
     server_parser.add_argument(
         "--roles",
-        default="driver,worker,cron",
+        default="driver,worker,cron,monitor",
         help="内嵌后台循环，逗号分隔（默认全部内嵌，单机模式）",
     )
 
@@ -184,7 +185,11 @@ def _run_up(args: argparse.Namespace) -> int:
 
 
 def build_runtime(settings: BrokerSettings, config_path: Path) -> ServerRuntime:
-    """组合根装配：绑定全部具体实现，构造 ServerRuntime。"""
+    """组合根装配：绑定全部具体实现，构造 ServerRuntime。
+
+    监控按 ``MonitoringSettings.enabled`` 接线：启用时构造 RedisMetricStore 与
+    driver/worker 两个采集器并注入；禁用时全部为 None（既有行为零变化）。
+    """
     client = aioredis.from_url(
         settings.redis_url,
         socket_connect_timeout=5.0,
@@ -196,9 +201,39 @@ def build_runtime(settings: BrokerSettings, config_path: Path) -> ServerRuntime:
     kv = RedisStore(client, prefix=settings.stream_prefix)
     crons = CronTable(client, prefix=settings.stream_prefix)
     registry = Registry(config_path)
-    executor = RunExecutor(registry, saver, broker, broker, broker, runs)
+    monitor = MonitoringSettings()
+    monitor_store: RedisMetricStore | None = None
+    driver_collector: MonitoringCollector | None = None
+    worker_collector: MonitoringCollector | None = None
+    if monitor.enabled:
+        monitor_store = RedisMetricStore(
+            client,
+            prefix=monitor.prefix,
+            broker_prefix=settings.stream_prefix,
+            group=settings.consumer_group,
+            retention_hours=monitor.retention_hours,
+            spans_per_graph=monitor.spans_per_graph,
+            event_log_size=monitor.event_log_size,
+        )
+        driver_collector = MonitoringCollector(
+            monitor_store, source="driver", queue_size=monitor.queue_size
+        )
+        worker_collector = MonitoringCollector(
+            monitor_store, source="worker", queue_size=monitor.queue_size
+        )
+    executor = RunExecutor(
+        registry, saver, broker, broker, broker, runs, collector=driver_collector
+    )
     dispatcher = ControlDispatcher(executor, runs, saver, broker)
-    worker = NodeWorker(registry, broker, broker, broker, concurrency=settings.worker_concurrency)
+    worker = NodeWorker(
+        registry,
+        broker,
+        broker,
+        broker,
+        concurrency=settings.worker_concurrency,
+        collector=worker_collector,
+        heartbeat_interval_seconds=monitor.heartbeat_interval_seconds,
+    )
     return ServerRuntime(
         redis=client,
         registry=registry,
@@ -213,6 +248,11 @@ def build_runtime(settings: BrokerSettings, config_path: Path) -> ServerRuntime:
         executor=executor,
         dispatcher=dispatcher,
         worker=worker,
+        monitor_store=monitor_store,
+        monitor_collectors=[
+            collector for collector in (driver_collector, worker_collector) if collector is not None
+        ],
+        monitor_probe_interval_seconds=monitor.probe_interval_seconds,
     )
 
 
@@ -235,6 +275,7 @@ def build_app(
         run_background=True,
         background_roles=background_roles,
         auth=auth,
+        monitor_store=runtime.monitor_store,
     )
 
 

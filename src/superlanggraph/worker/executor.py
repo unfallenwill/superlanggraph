@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import itertools
 import time
+import uuid
 from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
@@ -34,6 +35,7 @@ from superlanggraph.core.envelope import Envelope
 from superlanggraph.core.protocols import EventBus, ResultBus, TaskQueue
 from superlanggraph.core.serde import dumps_json_text
 from superlanggraph.core.task_codec import NodeOutcome, NodeTask, decode_task, encode_outcome
+from superlanggraph.monitoring import MonitoringCollector
 from superlanggraph.observability import extract_from_envelope, tracer
 from superlanggraph.observability import meter as get_meter
 from superlanggraph.registry.loader import Registry
@@ -94,6 +96,9 @@ class NodeWorker:
         results: ResultBus,
         events: EventBus,
         concurrency: int = 32,
+        collector: MonitoringCollector | None = None,
+        worker_id: str | None = None,
+        heartbeat_interval_seconds: float = 5.0,
     ) -> None:
         self._registry = registry
         self._tasks = tasks
@@ -101,9 +106,13 @@ class NodeWorker:
         self._events = events
         # 单 worker 进程内的任务并发度：dequeue 前先占槽，避免无界并发。
         self._slots = asyncio.Semaphore(concurrency)
+        self._concurrency = concurrency
         self._inflight: set[asyncio.Task[None]] = set()
         # 官方 stream_writer 是同步回调：事件先进内存队列，由排水任务写 Redis。
         self._outbox: asyncio.Queue[Envelope] = asyncio.Queue()
+        self._monitor = collector
+        self._worker_id = worker_id or uuid.uuid4().hex
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._tracer = tracer("superlanggraph.worker")
         self._task_duration = get_meter("superlanggraph.worker").create_histogram(
             "slg.task.duration", unit="s", description="节点任务执行时长"
@@ -114,17 +123,29 @@ class NodeWorker:
         周期回收 worker 死亡遗留的停滞任务（XAUTOCLAIM）。"""
         drain = asyncio.create_task(self._drain_outbox())
         reclaimer = asyncio.create_task(self._reclaim_loop(lease_seconds))
+        heartbeat = asyncio.create_task(self._heartbeat_loop())
         try:
             await self._serve_loop(lease_seconds)
         finally:
-            for background in (reclaimer, drain):
+            for background in (reclaimer, drain, heartbeat):
                 background.cancel()
-            for background in (reclaimer, drain):
+            for background in (reclaimer, drain, heartbeat):
                 with contextlib.suppress(asyncio.CancelledError):
                     await background
             # 优雅停机：等在飞任务收尾，未 ack 的由 XAUTOCLAIM 兜底。
             if self._inflight:
                 await asyncio.gather(*self._inflight, return_exceptions=True)
+
+    async def _heartbeat_loop(self) -> None:
+        """监控心跳：周期上报存活与负载（worker 面板数据源；未接线时零开销）。"""
+        while True:
+            await asyncio.sleep(self._heartbeat_interval_seconds)
+            if self._monitor is not None:
+                self._monitor.on_worker_heartbeat(
+                    worker_id=self._worker_id,
+                    inflight=len(self._inflight),
+                    concurrency=self._concurrency,
+                )
 
     async def _drain_outbox(self) -> None:
         while True:
@@ -190,6 +211,15 @@ class NodeWorker:
             await self._tasks.ack_task(ack_receipt)
             return
         started = time.monotonic()
+        if self._monitor is not None:
+            self._monitor.on_task_start(
+                run_id=task.run_id,
+                thread_id=task.thread_id,
+                graph_id=task.graph_id,
+                task_id=task.task_id,
+                node=task.node,
+                enqueued_ts=envelope.ts,
+            )
         with self._tracer.start_as_current_span(
             "task.execute",
             context=context,
@@ -205,6 +235,17 @@ class NodeWorker:
             if outcome.error_text:
                 span.set_attribute("task.error", outcome.error_text[:200])
             self._task_duration.record(time.monotonic() - started, {"task.node": task.node})
+        if self._monitor is not None:
+            self._monitor.on_task_end(
+                run_id=task.run_id,
+                thread_id=task.thread_id,
+                graph_id=task.graph_id,
+                task_id=task.task_id,
+                node=task.node,
+                outcome=outcome.kind,
+                duration_ms=(time.monotonic() - started) * 1000,
+                error=outcome.error_text or None,
+            )
         await self._results.publish_result(
             envelope.run_id,
             Envelope(
@@ -259,7 +300,7 @@ class NodeWorker:
             "run_name": task.node,
             "metadata": dict(task.metadata),
             "tags": list(task.tags),
-            "callbacks": [_messages_relay(task, self._outbox)],
+            "callbacks": [_messages_relay(task, self._outbox, self._monitor)],
             "configurable": {
                 "thread_id": task.thread_id,
                 "checkpoint_ns": task.checkpoint_ns,
@@ -314,13 +355,21 @@ def _custom_sink(task: NodeTask, outbox: asyncio.Queue[Envelope]):
     return writer
 
 
-def _messages_relay(task: NodeTask, outbox: asyncio.Queue[Envelope]) -> StreamMessagesHandler:
+def _messages_relay(
+    task: NodeTask,
+    outbox: asyncio.Queue[Envelope],
+    collector: MonitoringCollector | None = None,
+) -> StreamMessagesHandler:
     """messages 模式的 token 回传：把官方 handler 的三元组还原成事件信封。
 
     真实 LLM 调用发生在 worker，driver 侧挂的 StreamMessagesHandler 看不到
     token；callbacks 无法跨 Redis 信封序列化，只能在这里按官方同款契约重建。
     handler 回调收到 (ns, "messages", (message, metadata))，data 只取 payload，
     与 driver 直发形状一致。
+
+    ``collector`` 非空时顺路提取 usage_metadata 上报令牌用量（getattr 零解析
+    开销，不触碰 JSON 序列化路径）；多次分片上报由采集器按 task_id 做
+    max 合并。
     """
 
     def relay(item: StreamChunk) -> None:
@@ -333,6 +382,21 @@ def _messages_relay(task: NodeTask, outbox: asyncio.Queue[Envelope]) -> StreamMe
                 payload={"event": "messages", "data": dumps_json_text(payload)},
             )
         )
+        if collector is not None:
+            usage = getattr(payload[0], "usage_metadata", None)
+            if isinstance(usage, dict):
+                # isinstance 收窄后键值类型仍未知，显式固定 JSON 边界形状。
+                fields = cast("dict[str, Any]", usage)
+                collector.on_token_usage(
+                    task_id=task.task_id,
+                    run_id=task.run_id,
+                    thread_id=task.thread_id,
+                    graph_id=task.graph_id,
+                    node=task.node,
+                    input_tokens=int(fields.get("input_tokens") or 0),
+                    output_tokens=int(fields.get("output_tokens") or 0),
+                    total_tokens=int(fields.get("total_tokens") or 0),
+                )
 
     return StreamMessagesHandler(relay, False)
 

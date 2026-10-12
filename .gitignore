@@ -20,3 +20,4 @@ wheels/
 
 # 本地设计文档，不入库
 docs/
+.qoder/

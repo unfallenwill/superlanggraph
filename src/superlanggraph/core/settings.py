@@ -35,3 +35,18 @@ class AuthSettings(BaseSettings):
     @property
     def valid_keys(self) -> frozenset[str]:
         return frozenset(key.strip() for key in self.api_keys.split(",") if key.strip())
+
+
+class MonitoringSettings(BaseSettings):
+    """监控基础设施配置。环境变量前缀 SLG_MON_，如 SLG_MON_ENABLED=0。"""
+
+    model_config = SettingsConfigDict(env_prefix="SLG_MON_", env_file=".env", extra="ignore")
+
+    enabled: bool = True
+    prefix: str = "slg:mon"
+    retention_hours: int = 24
+    probe_interval_seconds: float = 10.0
+    heartbeat_interval_seconds: float = 5.0
+    queue_size: int = 10_000
+    spans_per_graph: int = 500
+    event_log_size: int = 500

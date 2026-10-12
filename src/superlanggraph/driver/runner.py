@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -33,6 +34,7 @@ from superlanggraph.core.envelope import Envelope
 from superlanggraph.core.protocols import ControlBus, EventBus, ResultBus, TaskQueue
 from superlanggraph.core.serde import dumps_json_text
 from superlanggraph.core.task_codec import NodeOutcome, NodeTask, decode_outcome, encode_task
+from superlanggraph.monitoring import MonitoringCollector
 from superlanggraph.observability import inject_into_envelope, tracer
 from superlanggraph.registry.loader import Registry
 
@@ -100,6 +102,7 @@ class RunExecutor:
         results: ResultBus,
         events: EventBus,
         store: RunStore,
+        collector: MonitoringCollector | None = None,
     ) -> None:
         self._registry = registry
         self._saver = saver
@@ -107,6 +110,7 @@ class RunExecutor:
         self._results = results
         self._events = events
         self._store = store
+        self._collector = collector
         self._pending: dict[tuple[str, str], asyncio.Future[NodeOutcome]] = {}
         self._tracer = tracer("superlanggraph.driver")
 
@@ -159,6 +163,7 @@ class RunExecutor:
 
     async def run(self, spec: RunSpec) -> None:
         """完整驱动一次 run（作为独立 asyncio.Task 运行）。"""
+        started_mono = time.monotonic()
         drain = asyncio.create_task(self._drain_results(spec.run_id))
         heartbeat = asyncio.create_task(self._heartbeat_loop(spec.run_id))
         interrupted = False
@@ -183,6 +188,13 @@ class RunExecutor:
                 )
                 base_id = _configurable_id(base.config) if base is not None else None
                 await self._store.update(spec.run_id, status="running", base_checkpoint_id=base_id)
+                if self._collector is not None:
+                    self._collector.on_run_lifecycle(
+                        run_id=spec.run_id,
+                        thread_id=spec.thread_id,
+                        graph_id=spec.graph_id,
+                        status="running",
+                    )
                 graph = self._registry.compile_distributed(
                     spec.graph_id, self, checkpointer=self._saver
                 )
@@ -212,22 +224,43 @@ class RunExecutor:
                         interrupted = True
                     await self._emit(spec.run_id, mode, ns, data)
                 await self._finish(
-                    spec.run_id,
-                    spec.thread_id,
+                    spec.run_id, spec.thread_id, "interrupted" if interrupted else "success"
+                )
+                self._report_lifecycle(
+                    spec,
                     "interrupted" if interrupted else "success",
+                    started_mono=started_mono,
                 )
             except asyncio.CancelledError:
                 await self._finish(spec.run_id, spec.thread_id, "interrupted")
+                self._report_lifecycle(spec, "interrupted", started_mono=started_mono)
             except Exception as exc:
                 await self._emit_text(
                     spec.run_id, "error", {"error": repr(exc), "message": str(exc)}
                 )
                 await self._finish(spec.run_id, spec.thread_id, "error", error=repr(exc))
+                self._report_lifecycle(
+                    spec, "error", error=repr(exc), started_mono=started_mono
+                )
             finally:
                 for key in [k for k in self._pending if k[0] == spec.run_id]:
                     self._pending.pop(key, None)
         heartbeat.cancel()
         drain.cancel()
+
+    def _report_lifecycle(
+        self, spec: RunSpec, status: str, error: str | None = None, *, started_mono: float
+    ) -> None:
+        """终态时上报 run 生命周期（监控接线；未注入采集器时零开销）。"""
+        if self._collector is not None:
+            self._collector.on_run_lifecycle(
+                run_id=spec.run_id,
+                thread_id=spec.thread_id,
+                graph_id=spec.graph_id,
+                status=status,
+                error=error,
+                duration_ms=(time.monotonic() - started_mono) * 1000,
+            )
 
     async def _heartbeat_loop(self, run_id: str) -> None:
         """driver 心跳：守尸据此区分「在跑」与「孤儿」。"""

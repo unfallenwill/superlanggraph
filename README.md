@@ -99,6 +99,13 @@ docker compose --profile observability up -d otel-collector
 # Prometheus 抓取端点: http://127.0.0.1:8889/metrics
 ```
 
+## 监控
+
+内置零依赖实时监控 UI：运行状态分布、节点耗时时间线、令牌用量、错误率、broker
+队列深度与 worker 存活，指标落既有 Redis，实时推送走 SSE，前端为无构建的原生页面。
+默认开启，可用 `SLG_MON_*` 环境变量调整，详见 [docs/monitoring.md](docs/monitoring.md)；
+服务启动后浏览器打开 `http://127.0.0.1:8000/monitor/ui/` 即可查看。
+
 ## 配置
 
 环境变量前缀 `SLG_`，经 `.env` 读取（定义见 `src/superlanggraph/core/settings.py`）：
